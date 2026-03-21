@@ -1,0 +1,10 @@
+[package]
+name = "conductor-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+conductor-types.workspace = true
+tokio.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true

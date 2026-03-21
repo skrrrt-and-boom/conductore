@@ -1,0 +1,19 @@
+[package]
+name = "conductor-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "conductor"
+path = "src/main.rs"
+
+[dependencies]
+conductor-types.workspace = true
+conductor-bridge.workspace = true
+conductor-core.workspace = true
+conductor-tui.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
