@@ -4,6 +4,7 @@
 //! shared memory coordination, and session persistence.
 
 pub mod caffeinate;
+pub mod conductor_agent;
 pub mod dag;
 pub mod insights;
 pub mod memory;
