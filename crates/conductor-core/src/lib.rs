@@ -4,6 +4,7 @@
 //! shared memory coordination, and session persistence.
 
 pub mod dag;
+pub mod insights;
 pub mod memory;
 pub mod rate_limiter;
 pub mod task_store;
