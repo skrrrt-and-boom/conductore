@@ -259,4 +259,74 @@ mod tests {
         assert!(new_offset > offset);
         fs::remove_file(&path).await.ok();
     }
+
+    // ─── read_truncated edge cases ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_truncated_returns_full_when_within_limit() {
+        let path = temp_path();
+        let mem = SharedMemory::new(&path);
+        mem.init().await.unwrap();
+        mem.append("A", "short").await.unwrap();
+        let full = mem.read().await.unwrap();
+        let truncated = mem.read_truncated(10_000).await.unwrap();
+        assert_eq!(full, truncated);
+        fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn read_truncated_keeps_recent_sections() {
+        let path = temp_path();
+        let mem = SharedMemory::new(&path);
+        mem.init().await.unwrap();
+        mem.append("Old", &"x".repeat(200)).await.unwrap();
+        mem.append("Mid", &"y".repeat(200)).await.unwrap();
+        mem.append("New", &"z".repeat(200)).await.unwrap();
+        // Limit fits ~2 sections but not all 3
+        let truncated = mem.read_truncated(450).await.unwrap();
+        assert!(truncated.contains("## New"));
+        assert!(truncated.contains("[...earlier entries truncated]"));
+        fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn read_truncated_no_sections_hard_slices() {
+        let path = temp_path();
+        // Write content without any ## headers
+        fs::write(&path, "a".repeat(500)).await.unwrap();
+        let mem = SharedMemory::new(&path);
+        let truncated = mem.read_truncated(100).await.unwrap();
+        assert!(truncated.contains("[...earlier entries truncated]"));
+        assert!(truncated.len() <= 200); // truncated prefix + 100 chars from end
+        fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn read_truncated_exact_boundary() {
+        let path = temp_path();
+        let mem = SharedMemory::new(&path);
+        mem.init().await.unwrap();
+        mem.append("A", "content").await.unwrap();
+        let full = mem.read().await.unwrap();
+        let truncated = mem.read_truncated(full.len()).await.unwrap();
+        assert_eq!(full, truncated);
+        fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn append_then_immediate_read_sees_complete_content() {
+        let path = temp_path();
+        let mem = SharedMemory::new(&path);
+        mem.init().await.unwrap();
+        // Rapid sequential writes + reads to exercise atomic_write
+        for i in 0..10 {
+            mem.append(&format!("Worker {i}"), &format!("result {i}"))
+                .await
+                .unwrap();
+            let content = mem.read().await.unwrap();
+            assert!(content.contains(&format!("## Worker {i}")));
+            assert!(content.contains("# Shared Memory"));
+        }
+        fs::remove_file(&path).await.ok();
+    }
 }
