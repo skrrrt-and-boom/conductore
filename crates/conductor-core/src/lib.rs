@@ -3,6 +3,7 @@
 //! Contains pure logic modules (DAG analysis, rate limiting, token estimation),
 //! shared memory coordination, and session persistence.
 
+pub mod caffeinate;
 pub mod dag;
 pub mod memory;
 pub mod rate_limiter;
