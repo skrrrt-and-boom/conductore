@@ -14,6 +14,7 @@ chrono.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+dirs = "6"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

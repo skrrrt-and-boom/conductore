@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OrchestraPhase {
     Init,
+    /// Legacy: kept for backward compat during initial plan
+    Planning,
     Exploring,
     Analyzing,
     Decomposing,
@@ -13,12 +15,22 @@ pub enum OrchestraPhase {
     PhaseExecuting,
     PhaseMerging,
     PhaseReviewing,
+    /// Legacy: flat execution (kept for backward compat)
+    Executing,
+    /// Legacy: end-of-run review
+    Reviewing,
     FinalReview,
     Integrating,
     Paused,
     Probing,
     Complete,
     Failed,
+}
+
+impl Default for OrchestraPhase {
+    fn default() -> Self {
+        Self::Init
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +72,34 @@ pub struct OrchestraState {
     pub total_cost_usd: f64,
 }
 
+impl OrchestraState {
+    pub fn new(config: OrchestraConfig) -> Self {
+        Self {
+            phase: OrchestraPhase::Init,
+            config,
+            tasks: Vec::new(),
+            plan: None,
+            phases: Vec::new(),
+            current_phase_index: -1,
+            musicians: Vec::new(),
+            analysts: Vec::new(),
+            analysis_results: Vec::new(),
+            rate_limit: RateLimitState::default(),
+            started_at: String::new(),
+            elapsed_ms: 0,
+            conductor_output: Vec::new(),
+            conductor_prompts: Vec::new(),
+            tokens: TokenUsage::default(),
+            tokens_estimated: false,
+            guidance_queue_size: 0,
+            plan_validation: None,
+            refinement_history: Vec::new(),
+            insights: Vec::new(),
+            total_cost_usd: 0.0,
+        }
+    }
+}
+
 // ─── Tasks ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +112,12 @@ pub enum TaskStatus {
     Failed,
     Blocked,
     Cancelled,
+}
+
+impl Default for TaskStatus {
+    fn default() -> Self {
+        Self::Queued
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +158,12 @@ pub enum PhaseStatus {
     Active,
     Completed,
     Failed,
+}
+
+impl Default for PhaseStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +224,12 @@ pub enum WorktreeStatus {
     Abandoned,
 }
 
+impl Default for WorktreeStatus {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
 // ─── Analysis ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +277,12 @@ pub enum MusicianStatus {
     Paused,
     Completed,
     Failed,
+}
+
+impl Default for MusicianStatus {
+    fn default() -> Self {
+        Self::Idle
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,6 +362,19 @@ pub enum RefinementRole {
 }
 
 // ─── Guidance ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuidanceInput {
+    pub user_messages: Vec<GuidanceMessage>,
+    pub task_status: String,
+    pub shared_memory: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuidanceMessage {
+    pub message: String,
+    pub timestamp: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuidanceActions {
@@ -463,4 +540,155 @@ pub struct SessionData {
     pub phases: Option<Vec<Phase>>,
     pub current_phase_index: Option<i32>,
     pub worktree_state: Option<Vec<WorktreeSnapshot>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip<T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug>(val: &T) {
+        let json = serde_json::to_string(val).expect("serialize");
+        let _: T = serde_json::from_str(&json).expect("deserialize");
+    }
+
+    fn sample_config() -> OrchestraConfig {
+        OrchestraConfig {
+            project_path: "/tmp/project".into(),
+            task_description: "Build a thing".into(),
+            musician_count: 3,
+            conductor_model: "opus".into(),
+            musician_model: "sonnet".into(),
+            max_turns: 50,
+            dry_run: false,
+            session_id: "sess-001".into(),
+            reference_session_id: None,
+            verification: None,
+        }
+    }
+
+    #[test]
+    fn orchestra_state_round_trip() {
+        let state = OrchestraState::new(sample_config());
+        round_trip(&state);
+    }
+
+    #[test]
+    fn task_round_trip() {
+        let task = Task {
+            id: "t1".into(),
+            index: 0,
+            title: "Do something".into(),
+            description: "Details".into(),
+            why: "Because".into(),
+            file_scope: vec!["src/main.rs".into()],
+            dependencies: vec![],
+            acceptance_criteria: vec!["It works".into()],
+            estimated_turns: 5,
+            model: None,
+            status: TaskStatus::Queued,
+            assigned_musician: None,
+            result: None,
+        };
+        round_trip(&task);
+    }
+
+    #[test]
+    fn task_result_round_trip() {
+        let result = TaskResult {
+            success: true,
+            files_modified: vec!["src/lib.rs".into()],
+            summary: "Done".into(),
+            error: None,
+            tokens_used: 1000,
+            duration_ms: 5000,
+            diff: Some("+added line".into()),
+            verification_output: Some("ok".into()),
+            verification_passed: Some(true),
+        };
+        round_trip(&result);
+    }
+
+    #[test]
+    fn claude_event_round_trip() {
+        let event = ClaudeEvent {
+            event_type: ClaudeEventType::Result,
+            subtype: None,
+            session_id: Some("s1".into()),
+            message: None,
+            tool_name: None,
+            tool_input: None,
+            tool_result_content: None,
+            result: Some("done".into()),
+            cost_usd: Some(0.05),
+            total_cost_usd: Some(0.10),
+            duration_ms: Some(3000),
+            duration_api_ms: Some(2500),
+            num_turns: Some(3),
+            is_error: Some(false),
+            resets_at: None,
+            usage: Some(TokenUsage { input: 100, output: 50, cache_read: 0, cache_creation: 0 }),
+        };
+        round_trip(&event);
+    }
+
+    #[test]
+    fn session_data_round_trip() {
+        let session = SessionData {
+            id: "sess-001".into(),
+            config: sample_config(),
+            phase: OrchestraPhase::Init,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            last_updated_at: "2026-01-01T00:01:00Z".into(),
+            tokens: TokenUsage::default(),
+            tokens_estimated: false,
+            tasks: vec![],
+            phases: None,
+            current_phase_index: None,
+            worktree_state: None,
+        };
+        round_trip(&session);
+    }
+
+    #[test]
+    fn phase_round_trip() {
+        let phase = Phase {
+            id: "p1".into(),
+            index: 0,
+            title: "Phase 1".into(),
+            description: "First phase".into(),
+            status: PhaseStatus::Pending,
+            tasks: vec![],
+            review_result: None,
+            token_used: 0,
+        };
+        round_trip(&phase);
+    }
+
+    #[test]
+    fn enum_defaults() {
+        assert_eq!(OrchestraPhase::default(), OrchestraPhase::Init);
+        assert_eq!(TaskStatus::default(), TaskStatus::Queued);
+        assert_eq!(PhaseStatus::default(), PhaseStatus::Pending);
+        assert_eq!(MusicianStatus::default(), MusicianStatus::Idle);
+        assert_eq!(WorktreeStatus::default(), WorktreeStatus::Active);
+    }
+
+    #[test]
+    fn token_usage_default_is_zero() {
+        let t = TokenUsage::default();
+        assert_eq!(t.input, 0);
+        assert_eq!(t.output, 0);
+        assert_eq!(t.cache_read, 0);
+        assert_eq!(t.cache_creation, 0);
+    }
+
+    #[test]
+    fn orchestra_state_new_defaults() {
+        let state = OrchestraState::new(sample_config());
+        assert_eq!(state.phase, OrchestraPhase::Init);
+        assert_eq!(state.current_phase_index, -1);
+        assert!(state.tasks.is_empty());
+        assert!(state.musicians.is_empty());
+        assert_eq!(state.total_cost_usd, 0.0);
+    }
 }
