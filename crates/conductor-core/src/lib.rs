@@ -7,10 +7,13 @@ pub mod caffeinate;
 pub mod dag;
 pub mod insights;
 pub mod memory;
+pub mod musician;
+pub mod orchestra;
 pub mod rate_limiter;
 pub mod task_store;
 pub mod token_estimate;
 pub mod tool_summary;
+pub mod worktree_manager;
 
 /// Core error type for conductor-core operations.
 #[derive(Debug, thiserror::Error)]
@@ -23,4 +26,19 @@ pub enum CoreError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// Git command or worktree operation failed.
+    #[error("git error: {0}")]
+    Git(String),
+
+    /// Channel send/receive failure.
+    #[error("channel error: {0}")]
+    Channel(String),
+
+    /// Operation timed out.
+    #[error("timeout: {0}")]
+    Timeout(String),
+
+    /// Bridge (Claude CLI session) error.
+    #[error("bridge error: {0}")]
+    Bridge(String),
 }
