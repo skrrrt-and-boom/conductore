@@ -166,12 +166,15 @@ async fn atomic_write(path: &Path, content: &str) -> Result<(), CoreError> {
 }
 
 fn rand_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos();
-    format!("{nanos:x}")
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{seq}")
 }
 
 #[cfg(test)]
