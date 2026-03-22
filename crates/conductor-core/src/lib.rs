@@ -26,6 +26,13 @@ pub enum CoreError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// JSON parsing failed on LLM output — carries the raw output for display.
+    #[error("Failed to parse JSON from LLM output: {reason}")]
+    JsonParse {
+        reason: String,
+        raw_output: String,
+    },
+
     /// Git command or worktree operation failed.
     #[error("git error: {0}")]
     Git(String),

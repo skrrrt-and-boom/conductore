@@ -769,12 +769,15 @@ pub fn sanitize_json(raw: &str) -> String {
 
 /// Parse typed JSON from LLM output, extracting the JSON block first.
 fn parse_json_from_output<T: serde::de::DeserializeOwned>(output: &str) -> Result<T, CoreError> {
-    let block =
-        extract_json_block(output).ok_or_else(|| CoreError::Json(serde_json::Error::io(
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "No JSON block found in output"),
-        )))?;
+    let block = extract_json_block(output).ok_or_else(|| CoreError::JsonParse {
+        reason: "No JSON block found in LLM output".into(),
+        raw_output: output.to_string(),
+    })?;
     let sanitized = sanitize_json(block);
-    serde_json::from_str(&sanitized).map_err(CoreError::Json)
+    serde_json::from_str(&sanitized).map_err(|e| CoreError::JsonParse {
+        reason: format!("Invalid JSON: {e}"),
+        raw_output: output.to_string(),
+    })
 }
 
 /// Parse a serde_json::Value from LLM output.

@@ -690,10 +690,10 @@ impl Orchestra {
                 self.push_conductor_output("Exploration complete.");
                 self.codebase_map = Some(map);
             }
-            Err(e) => {
-                self.push_conductor_output(&format!(
-                    "Exploration output parsing failed (continuing): {e}"
-                ));
+            Err(_) => {
+                self.push_conductor_output(
+                    "Exploration did not produce structured output (continuing to decomposition)."
+                );
             }
         }
         self.broadcast_state();
@@ -731,9 +731,44 @@ impl Orchestra {
                 };
                 (conductor, result)
             })
-        }).await?;
+        }).await;
+
+        let decomposition = match decomposition {
+            Ok(d) => d,
+            Err(CoreError::JsonParse { raw_output, .. }) => {
+                // Claude responded conversationally without a plan.
+                // The response is already visible in conductor output (streamed via emit).
+                // Show it cleanly and complete — nothing to execute.
+                self.push_conductor_output("");
+                self.push_conductor_output("No actionable plan was produced. The task may be too vague or conversational.");
+                self.push_conductor_output("Tip: describe a specific coding task, e.g. \"Add retry logic to the API client\"");
+                self.set_phase(OrchestraPhase::Complete);
+                self.broadcast_state();
+                let _ = self.persist_state().await;
+                // Return the raw output for headless mode stderr display
+                return Err(CoreError::JsonParse {
+                    reason: "No actionable plan produced".into(),
+                    raw_output,
+                });
+            }
+            Err(e) => {
+                self.push_conductor_output(&format!("Decomposition failed: {e}"));
+                self.set_phase(OrchestraPhase::Failed);
+                self.broadcast_state();
+                return Err(e);
+            }
+        };
 
         self.phases = decomposition.phases;
+
+        // Guard: empty plan means decomposition produced nothing actionable
+        if self.phases.is_empty() {
+            self.push_conductor_output("Decomposition produced no phases — nothing to execute.");
+            self.push_conductor_output(&format!("Summary: {}", decomposition.summary));
+            self.set_phase(OrchestraPhase::Complete);
+            self.broadcast_state();
+            return Ok(());
+        }
 
         // Build flat task list
         let mut global_index = 0;
@@ -1402,12 +1437,41 @@ impl Orchestra {
 
                 let phase_ref = self.phases[pi].clone();
                 let completed_ref = completed_phases.clone();
-                let detailed_tasks = self.run_conductor_op(move |mut conductor| {
+                let detail_result = self.run_conductor_op(move |mut conductor| {
                     Box::pin(async move {
                         let result = conductor.detail_phase(&phase_ref, &completed_ref).await;
                         (conductor, result)
                     })
-                }).await?;
+                }).await;
+
+                let detailed_tasks = match detail_result {
+                    Ok(tasks) => tasks,
+                    Err(CoreError::JsonParse { reason, raw_output }) => {
+                        self.push_conductor_output(&format!(
+                            "Phase {} detailing failed: {reason}",
+                            pi + 1
+                        ));
+                        if !raw_output.is_empty() {
+                            self.push_conductor_output("--- Claude's response ---");
+                            self.push_conductor_output(&raw_output);
+                            self.push_conductor_output("--- end response ---");
+                        }
+                        self.phases[pi].status = PhaseStatus::Failed;
+                        self.set_phase(OrchestraPhase::Failed);
+                        self.broadcast_state();
+                        return Err(CoreError::JsonParse { reason, raw_output });
+                    }
+                    Err(e) => {
+                        self.push_conductor_output(&format!(
+                            "Phase {} detailing failed: {e}",
+                            pi + 1
+                        ));
+                        self.phases[pi].status = PhaseStatus::Failed;
+                        self.set_phase(OrchestraPhase::Failed);
+                        self.broadcast_state();
+                        return Err(e);
+                    }
+                };
 
                 let base_index = self.tasks.len();
                 for (ti, mut task) in detailed_tasks.into_iter().enumerate() {
@@ -1459,12 +1523,46 @@ impl Orchestra {
             let all_phases = self.phases.clone();
             let retry_count = *phase_retry_count.get(&pi).unwrap_or(&0);
 
-            let review = self.run_conductor_op(move |mut conductor| {
+            let review_result = self.run_conductor_op(move |mut conductor| {
                 Box::pin(async move {
                     let result = conductor.review_phase(&phase_ref, &all_phases, &phase_diffs, retry_count).await;
                     (conductor, result)
                 })
-            }).await?;
+            }).await;
+
+            let review = match review_result {
+                Ok(r) => r,
+                Err(CoreError::JsonParse { reason, raw_output }) => {
+                    self.push_conductor_output(&format!(
+                        "Phase {} review parse failed (continuing): {reason}",
+                        pi + 1
+                    ));
+                    if !raw_output.is_empty() {
+                        self.push_conductor_output("--- Claude's response ---");
+                        self.push_conductor_output(&raw_output);
+                        self.push_conductor_output("--- end response ---");
+                    }
+                    // Default to continue on review parse failure
+                    conductor_types::PhaseReviewResult {
+                        action: PhaseReviewAction::Continue,
+                        summary: format!("Review parse failed, defaulting to continue: {reason}"),
+                        task_indices: None,
+                        revised_phases: None,
+                    }
+                }
+                Err(e) => {
+                    self.push_conductor_output(&format!(
+                        "Phase {} review failed (continuing): {e}",
+                        pi + 1
+                    ));
+                    conductor_types::PhaseReviewResult {
+                        action: PhaseReviewAction::Continue,
+                        summary: format!("Review failed, defaulting to continue: {e}"),
+                        task_indices: None,
+                        revised_phases: None,
+                    }
+                }
+            };
 
             self.phases[pi].review_result = Some(review.clone());
 
@@ -1622,12 +1720,34 @@ impl Orchestra {
             verification_results: Some(verification_results),
         };
 
-        let review = self.run_conductor_op(move |mut conductor| {
+        let review_result = self.run_conductor_op(move |mut conductor| {
             Box::pin(async move {
                 let result = conductor.review(&input).await;
                 (conductor, result)
             })
-        }).await?;
+        }).await;
+
+        let review = match review_result {
+            Ok(r) => r,
+            Err(CoreError::JsonParse { reason, raw_output }) => {
+                self.push_conductor_output(&format!("Final review parse failed: {reason}"));
+                if !raw_output.is_empty() {
+                    self.push_conductor_output("--- Claude's response ---");
+                    self.push_conductor_output(&raw_output);
+                    self.push_conductor_output("--- end response ---");
+                }
+                // Complete anyway — work is done, only review parsing failed
+                self.set_phase(OrchestraPhase::Complete);
+                self.broadcast_state();
+                return Ok(());
+            }
+            Err(e) => {
+                self.push_conductor_output(&format!("Final review failed: {e}"));
+                self.set_phase(OrchestraPhase::Complete);
+                self.broadcast_state();
+                return Ok(());
+            }
+        };
 
         self.insight_generator.on_conductor_decision(
             &format!("Review: {}", review.action),

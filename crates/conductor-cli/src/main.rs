@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use conductor_bridge::{validate_claude_cli, validate_model};
-use conductor_core::{orchestra::Orchestra, task_store::TaskStore};
+use conductor_core::{orchestra::Orchestra, task_store::TaskStore, CoreError};
 use conductor_types::OrchestraConfig;
 use tracing::info;
 use uuid::Uuid;
@@ -387,6 +387,9 @@ async fn run_headless(
             orchestra.run().await?;
             orchestra.event_loop().await
         } => {
+            if let Err(ref e) = result {
+                print_json_parse_output(e);
+            }
             result.map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         _ = tokio::signal::ctrl_c() => {
@@ -423,6 +426,9 @@ async fn resume_session(session_id: String) -> Result<()> {
             orchestra.run().await?;
             orchestra.event_loop().await
         } => {
+            if let Err(ref e) = result {
+                print_json_parse_output(e);
+            }
             result.map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         _ = tokio::signal::ctrl_c() => {
@@ -431,4 +437,13 @@ async fn resume_session(session_id: String) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Print raw Claude output when a JsonParse error occurs, so users see what Claude said.
+fn print_json_parse_output(e: &CoreError) {
+    if let CoreError::JsonParse { raw_output, .. } = e {
+        if !raw_output.is_empty() {
+            eprintln!("\n--- Claude's response ---\n{raw_output}\n--- end response ---");
+        }
+    }
 }
