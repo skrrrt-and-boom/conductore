@@ -17,7 +17,7 @@ use conductor_types::{
     AnalysisResult, AnalystState, CodebaseMap, GuidanceActions, GuidanceInput, GuidanceMessage,
     Insight, InsightCategory, MusicianState, MusicianStatus, OrchestraConfig,
     OrchestraEvent, OrchestraPhase, OrchestraState, Phase, PhaseReviewAction, PhaseStatus, Plan,
-    PlanRefinementMessage, PlanValidation, RefinementRole, Task, TaskResult,
+    PlanRefinementMessage, PlanValidation, RefinementRole, SessionData, Task, TaskResult,
     TaskStatus, UserAction, WorktreeSnapshot, WorktreeStatus,
 };
 use tokio::process::Command;
@@ -281,6 +281,67 @@ impl Orchestra {
         (orchestra, state_rx, action_tx)
     }
 
+    /// Restore orchestra state from a previously persisted session.
+    ///
+    /// This replaces the orchestra's phase, tasks, phases, and worktree state
+    /// with data loaded from disk, enabling true session resume instead of
+    /// re-planning from scratch.
+    pub fn restore_session(&mut self, session: SessionData) {
+        // Swap task store to use the restored session's ID
+        self.task_store = TaskStore::new(&session.id);
+        self.config.session_id = session.id.clone();
+        self.config.task_description = session.config.task_description;
+
+        // Restore phase state
+        self.phase = session.phase;
+        self.tasks = session.tasks;
+        self.started_at = session.started_at;
+
+        if let Some(phases) = session.phases {
+            self.phases = phases;
+        }
+        self.current_phase_index = session.current_phase_index;
+
+        // Restore worktrees
+        if let Some(ref snapshots) = session.worktree_state {
+            self.worktree_snapshots = snapshots.clone();
+            self.worktree_manager.restore_from_snapshots(snapshots);
+        }
+
+        // Reset in-progress tasks to Queued (musician processes are dead)
+        for task in &mut self.tasks {
+            if task.status == TaskStatus::InProgress {
+                task.status = TaskStatus::Queued;
+                task.assigned_musician = None;
+                task.result = None;
+            }
+        }
+        for phase in &mut self.phases {
+            for task in &mut phase.tasks {
+                if task.status == TaskStatus::InProgress {
+                    task.status = TaskStatus::Queued;
+                    task.assigned_musician = None;
+                    task.result = None;
+                }
+            }
+        }
+
+        // Rebuild Plan object from restored data
+        if !self.tasks.is_empty() {
+            self.plan = Some(Plan {
+                summary: format!("Resumed session {}", session.id),
+                tasks: self.tasks.clone(),
+                dependency_graph: String::new(),
+                musician_assignment: String::new(),
+                learning_notes: Vec::new(),
+                estimated_minutes: 0,
+                insights: None,
+            });
+        }
+
+        self.broadcast_state();
+    }
+
     /// Build and broadcast the current OrchestraState.
     fn broadcast_state(&mut self) {
         self.state = OrchestraState {
@@ -420,12 +481,55 @@ impl Orchestra {
             return Ok(());
         }
 
-        // Planning phase
-        match self.do_plan().await {
-            Ok(()) => {}
-            Err(e) => {
-                self.set_phase(OrchestraPhase::Failed);
-                return Err(e);
+        // Branch based on current phase — allows restored sessions to skip planning
+        match self.phase {
+            OrchestraPhase::Init => {
+                // Fresh session — plan from scratch
+                match self.do_plan().await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.set_phase(OrchestraPhase::Failed);
+                        return Err(e);
+                    }
+                }
+            }
+            OrchestraPhase::PlanReview => {
+                // Already have a plan, go straight to review
+                self.push_conductor_output("Resumed session — plan ready for review.");
+                self.broadcast_state();
+            }
+            OrchestraPhase::PhaseDetailing
+            | OrchestraPhase::PhaseExecuting
+            | OrchestraPhase::PhaseMerging
+            | OrchestraPhase::PhaseReviewing => {
+                // Mid-execution — present plan for approval, then continue from saved phase
+                self.push_conductor_output(&format!(
+                    "Resumed session — continuing from phase {}.",
+                    self.current_phase_index.map(|i| i + 1).unwrap_or(1),
+                ));
+                self.set_phase(OrchestraPhase::PlanReview);
+                if self.config.headless {
+                    self.start_execution().await?;
+                }
+            }
+            OrchestraPhase::FinalReview | OrchestraPhase::Reviewing => {
+                self.push_conductor_output("Resumed session — proceeding to review.");
+                self.do_final_review().await?;
+            }
+            OrchestraPhase::Complete | OrchestraPhase::Failed => {
+                self.push_conductor_output("Session already finished.");
+                self.broadcast_state();
+            }
+            // Exploring, Analyzing, Decomposing, Planning, etc. — mid-planning, re-plan
+            _ => {
+                self.phase = OrchestraPhase::Init;
+                match self.do_plan().await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.set_phase(OrchestraPhase::Failed);
+                        return Err(e);
+                    }
+                }
             }
         }
 
@@ -527,7 +631,12 @@ impl Orchestra {
                 musician_id,
                 result,
             } => {
-                self.active_musicians.remove(&musician_id);
+                // NOTE: We intentionally do NOT remove from active_musicians here.
+                // The JoinHandle must be awaited before drain_musician_returns can
+                // pick up the returned musician. Removing it here would lose the
+                // handle, leaving the musician slot as None and preventing second-
+                // wave task assignment. The event-handler path cleans up finished
+                // handles after the drain loop (see execute_loop).
                 self.active_start_times.remove(&musician_id);
                 self.guidance_channels.remove(&musician_id);
 
@@ -544,12 +653,25 @@ impl Orchestra {
                     };
                 }
 
-                // Store result in the matching task
+                // Store result AND update task status directly — don't defer to
+                // sync_task_results() which relies on musician_states.current_task
+                // being correct. Updating here is authoritative and immediate.
                 if let Some(ms) = self.musician_states.iter().find(|m| m.id == musician_id) {
                     if let Some(ref task) = ms.current_task {
-                        if let Some(t) = self.tasks.iter_mut().find(|t| t.index == task.index) {
+                        let task_index = task.index;
+                        if let Some(t) = self.tasks.iter_mut().find(|t| t.index == task_index) {
                             t.result = Some(result.clone());
+                            if t.status == TaskStatus::InProgress {
+                                t.status = if result.success {
+                                    TaskStatus::Completed
+                                } else {
+                                    TaskStatus::Failed
+                                };
+                            }
                         }
+                        // Keep phase tasks in sync
+                        let new_status = if result.success { TaskStatus::Completed } else { TaskStatus::Failed };
+                        self.sync_task_to_phase(task_index, new_status, Some(result.clone()));
                     }
                 }
 
@@ -610,18 +732,42 @@ impl Orchestra {
             }
             UserAction::ResumeSession { session_id } => {
                 if self.phase == OrchestraPhase::Init {
-                    // Load the previous session and re-submit its task
                     match TaskStore::resolve_id(&session_id).await {
                         Some(resolved) => {
                             let store = TaskStore::new(&resolved);
                             match store.load_session().await {
                                 Ok(Some(prev)) => {
-                                    self.config.task_description = prev.config.task_description;
-                                    self.config.reference_session_id = Some(resolved.clone());
-                                    tracing::info!(session_id = %resolved, "resuming session");
-                                    if let Err(e) = self.do_plan().await {
-                                        tracing::error!(error = %e, "planning failed");
-                                        self.set_phase(OrchestraPhase::Failed);
+                                    tracing::info!(session_id = %resolved, phase = ?prev.phase, "resuming session");
+                                    let prev_phase = prev.phase.clone();
+                                    self.restore_session(prev);
+
+                                    match prev_phase {
+                                        OrchestraPhase::PlanReview => {
+                                            self.push_conductor_output("Resumed — plan ready for review.");
+                                            self.broadcast_state();
+                                        }
+                                        OrchestraPhase::PhaseDetailing
+                                        | OrchestraPhase::PhaseExecuting
+                                        | OrchestraPhase::PhaseMerging
+                                        | OrchestraPhase::PhaseReviewing => {
+                                            self.push_conductor_output(&format!(
+                                                "Resumed — continuing from phase {}. Approve to proceed.",
+                                                self.current_phase_index.map(|i| i + 1).unwrap_or(1),
+                                            ));
+                                            self.set_phase(OrchestraPhase::PlanReview);
+                                            self.broadcast_state();
+                                        }
+                                        OrchestraPhase::Complete | OrchestraPhase::Failed => {
+                                            self.push_conductor_output("Session already finished.");
+                                            self.broadcast_state();
+                                        }
+                                        _ => {
+                                            // Mid-planning or Init — re-plan
+                                            if let Err(e) = self.do_plan().await {
+                                                tracing::error!(error = %e, "planning failed");
+                                                self.set_phase(OrchestraPhase::Failed);
+                                            }
+                                        }
                                     }
                                 }
                                 Ok(None) => {
@@ -1195,6 +1341,22 @@ impl Orchestra {
                     while let Ok(event) = event_rx.try_recv() {
                         self.handle_event(event).await;
                     }
+
+                    // Await finished musician handles so their return_tx.send()
+                    // completes before we drain. Without this, the musician slot
+                    // stays None and try_assign_tasks can't assign second-wave tasks.
+                    let finished: Vec<String> = self.active_musicians.iter()
+                        .filter(|(_, h)| h.is_finished())
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    for id in &finished {
+                        if let Some(handle) = self.active_musicians.remove(id) {
+                            if let Err(e) = handle.await {
+                                tracing::error!(musician = %id, error = %e, "musician task panicked");
+                            }
+                        }
+                    }
+
                     self.drain_musician_returns();
                     self.sync_task_results().await;
                     needs_assignment = true;
@@ -1399,6 +1561,7 @@ impl Orchestra {
     /// Sync task results from musician completion events and run verification.
     async fn sync_task_results(&mut self) {
         let mut newly_completed: Vec<(usize, Option<String>)> = Vec::new();
+        let mut phase_syncs: Vec<(usize, TaskStatus, Option<TaskResult>)> = Vec::new();
 
         for ms in &self.musician_states {
             if ms.status == MusicianStatus::Completed || ms.status == MusicianStatus::Failed {
@@ -1410,6 +1573,7 @@ impl Orchestra {
                             } else {
                                 TaskStatus::Failed
                             };
+                            phase_syncs.push((t.index, t.status.clone(), t.result.clone()));
                             // Track newly completed tasks for verification
                             if t.status == TaskStatus::Completed {
                                 if let Some(snap) = self
@@ -1430,6 +1594,11 @@ impl Orchestra {
             }
         }
 
+        // Sync status changes to phase tasks
+        for (idx, status, result) in phase_syncs {
+            self.sync_task_to_phase(idx, status, result);
+        }
+
         // Run verification on newly completed tasks — collect results first to avoid borrow conflicts
         let mut verification_results: Vec<(usize, Option<(String, String, bool)>)> = Vec::new();
         for (task_index, worktree_path) in &newly_completed {
@@ -1443,6 +1612,7 @@ impl Orchestra {
         }
 
         // Apply verification results to tasks
+        let mut post_verify_syncs: Vec<(usize, TaskStatus, Option<TaskResult>)> = Vec::new();
         for (task_index, result) in verification_results {
             if let Some(t) = self.tasks.iter_mut().find(|t| t.index == task_index) {
                 match result {
@@ -1466,11 +1636,36 @@ impl Orchestra {
                         }
                     }
                 }
+                post_verify_syncs.push((task_index, t.status.clone(), t.result.clone()));
             }
+        }
+        // Sync verification results to phase tasks
+        for (idx, status, result) in post_verify_syncs {
+            self.sync_task_to_phase(idx, status, result);
         }
 
         let _ = self.task_store.save_tasks(&self.tasks).await;
         let _ = self.persist_state().await;
+    }
+
+    /// Sync a task's status and result back into `self.phases[*].tasks`.
+    ///
+    /// `self.tasks` is the authoritative flat list, but phase review and
+    /// broadcast also read from `self.phases[pi].tasks`. Without this sync
+    /// the phase copies stay stale after `sync_task_results` updates them.
+    fn sync_task_to_phase(
+        &mut self,
+        task_index: usize,
+        status: TaskStatus,
+        result: Option<TaskResult>,
+    ) {
+        for phase in &mut self.phases {
+            if let Some(t) = phase.tasks.iter_mut().find(|t| t.index == task_index) {
+                t.status = status;
+                t.result = result;
+                break;
+            }
+        }
     }
 
     // ─── V2: Phase-Based Execution ─────────────────────────────
@@ -1479,10 +1674,25 @@ impl Orchestra {
         let mut completed_phases: Vec<Phase> = Vec::new();
         let mut phase_retry_count: HashMap<usize, u32> = HashMap::new();
 
-        let mut pi = 0;
+        // On resume, collect already-completed phases and start from saved index
+        let start_index = self.current_phase_index.unwrap_or(0);
+        for i in 0..start_index.min(self.phases.len()) {
+            if self.phases[i].status == PhaseStatus::Completed {
+                completed_phases.push(self.phases[i].clone());
+            }
+        }
+
+        let mut pi = start_index;
         while pi < self.phases.len() {
             if self.phase == OrchestraPhase::Failed {
                 return Ok(());
+            }
+
+            // Skip already-completed phases (from previous session)
+            if self.phases[pi].status == PhaseStatus::Completed {
+                completed_phases.push(self.phases[pi].clone());
+                pi += 1;
+                continue;
             }
 
             self.current_phase_index = Some(pi);
@@ -1655,7 +1865,10 @@ impl Orchestra {
                         self.phases[pi].status = PhaseStatus::Completed;
                         completed_phases.push(self.phases[pi].clone());
                     } else {
-                        // Reset specified tasks or all failed tasks
+                        // Reset specified tasks or all non-completed tasks.
+                        // Guard: never reset tasks that completed successfully —
+                        // the conductor LLM sometimes requests retrying tasks that
+                        // actually passed, especially when diffs are missing.
                         let indices_to_retry: Vec<usize> = review
                             .task_indices
                             .unwrap_or_else(|| {
@@ -1667,10 +1880,25 @@ impl Orchestra {
                                     .map(|(i, _)| i)
                                     .collect()
                             });
+                        let mut actually_retried = 0;
                         for idx in indices_to_retry {
                             if let Some(task) = self.phases[pi].tasks.get_mut(idx) {
+                                // Skip successfully completed tasks — don't undo good work
+                                if task.status == TaskStatus::Completed {
+                                    if let Some(ref r) = task.result {
+                                        if r.success {
+                                            tracing::info!(
+                                                task_index = task.index,
+                                                title = %task.title,
+                                                "skipping retry of successfully completed task"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
                                 task.status = TaskStatus::Queued;
                                 task.result = None;
+                                actually_retried += 1;
                                 // Also update in global tasks
                                 if let Some(t) =
                                     self.tasks.iter_mut().find(|t| t.index == task.index)
@@ -1679,6 +1907,17 @@ impl Orchestra {
                                     t.result = None;
                                 }
                             }
+                        }
+                        // If no tasks actually need retrying, skip the retry
+                        if actually_retried == 0 {
+                            self.push_conductor_output(&format!(
+                                "Phase {} review requested retry but all tasks succeeded — continuing",
+                                pi + 1
+                            ));
+                            self.phases[pi].status = PhaseStatus::Completed;
+                            completed_phases.push(self.phases[pi].clone());
+                            pi += 1;
+                            continue;
                         }
                         // Retry this phase
                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;

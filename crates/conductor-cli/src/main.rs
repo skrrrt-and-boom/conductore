@@ -416,10 +416,10 @@ async fn resume_session(session_id: String) -> Result<()> {
         .await
         .context("Claude CLI validation failed")?;
 
-    let config = session.config;
-    info!(session_id = %resolved, "Resuming session");
+    info!(session_id = %resolved, phase = ?session.phase, "Resuming session");
 
-    let (mut orchestra, _state_rx, _action_tx) = Orchestra::new(config);
+    let (mut orchestra, _state_rx, _action_tx) = Orchestra::new(session.config.clone());
+    orchestra.restore_session(session);
 
     tokio::select! {
         result = async {

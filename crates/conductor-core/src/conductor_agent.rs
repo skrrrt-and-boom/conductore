@@ -163,7 +163,15 @@ impl ConductorAgent {
         });
 
         let output = self.send_and_collect(&prompt).await?;
-        let parsed: CodebaseMap = parse_json_from_output(&output)?;
+        let mut parsed: CodebaseMap = parse_json_from_output(&output)?;
+        // Auto-generate IDs for directives that the LLM didn't provide
+        if let Some(ref mut directives) = parsed.analysis_directives {
+            for (i, d) in directives.iter_mut().enumerate() {
+                if d.id.is_empty() {
+                    d.id = format!("analyst-{}", i + 1);
+                }
+            }
+        }
         Ok(parsed)
     }
 

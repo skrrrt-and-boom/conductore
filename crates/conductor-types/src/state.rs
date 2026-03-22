@@ -228,11 +228,18 @@ impl Default for WorktreeStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisDirective {
+    #[serde(default)]
     pub id: String,
     pub area: String,
     pub question: String,
+    #[serde(default)]
     pub file_hints: Vec<String>,
+    #[serde(default = "default_estimated_turns")]
     pub estimated_turns: u32,
+}
+
+fn default_estimated_turns() -> u32 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

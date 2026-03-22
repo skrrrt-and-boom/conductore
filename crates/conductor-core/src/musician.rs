@@ -326,27 +326,47 @@ impl Musician {
 
         self.session = Some(session);
 
-        // Event processing loop — select on both Claude events and user guidance
+        // Event processing loop — select on both Claude events and user guidance.
+        // IMPORTANT: claude_rx closure must break the loop immediately. The `else`
+        // branch only fires when ALL select branches are disabled, but guidance_rx
+        // stays open (orchestra holds the sender until it receives MusicianComplete,
+        // which is sent AFTER this loop). Using `else => break` would deadlock.
         loop {
             let event = tokio::select! {
-                Some(event) = claude_rx.recv() => event,
+                result = claude_rx.recv() => {
+                    match result {
+                        Some(event) => event,
+                        None => break, // Claude session ended — exit loop
+                    }
+                }
                 Some(msg) = guidance_rx.recv() => {
                     // Inject user guidance into the running session
-                    if let Some(ref mut session) = self.session {
+                    let sent = if let Some(ref mut session) = self.session {
                         if !session.is_closed() {
                             let _ = session.send_message(&msg).await;
-                            self.push_output(&format!("[USER] {msg}"));
-                            let _ = event_tx
-                                .send(OrchestraEvent::MusicianOutput {
-                                    musician_id: self.id.clone(),
-                                    line: format!("[USER] {msg}"),
-                                })
-                                .await;
+                            true
+                        } else {
+                            false
                         }
-                    }
+                    } else {
+                        false
+                    };
+                    let label = if sent {
+                        format!("[USER] {msg}")
+                    } else {
+                        format!("[USER] (session closed) {msg}")
+                    };
+                    self.push_output(&label);
+                    let _ = event_tx
+                        .send(OrchestraEvent::MusicianOutput {
+                            musician_id: self.id.clone(),
+                            line: label,
+                        })
+                        .await;
+                    // Broadcast updated state so TUI shows the [USER] line
+                    self.send_status_change(&event_tx).await;
                     continue;
                 }
-                else => break,
             };
 
             self.state.elapsed_ms = start.elapsed().as_millis() as u64;

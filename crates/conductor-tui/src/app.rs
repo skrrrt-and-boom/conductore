@@ -354,9 +354,12 @@ impl TuiApp {
         // Prompt input mode — when user is typing or browsing history
         // Up/Down only enter prompt mode if already typing or browsing history,
         // so that bare Up/Down scrolls the chat panel instead.
+        // Exception: in Init phase, Up/Down always browse history (nothing to scroll).
         let in_prompt_mode = !ui.prompt_input.is_empty()
             || ui.history_index.is_some()
-            || (matches!(key.code, KeyCode::Char(_)) && !is_navigation_key(&key));
+            || (matches!(key.code, KeyCode::Char(_)) && !is_navigation_key(&key))
+            || (state.phase == OrchestraPhase::Init
+                && matches!(key.code, KeyCode::Up | KeyCode::Down));
         if in_prompt_mode {
             match key.code {
                 KeyCode::Enter => {
