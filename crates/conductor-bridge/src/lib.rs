@@ -4,7 +4,7 @@ pub mod parse;
 pub mod session;
 pub mod validate;
 
-pub use parse::{is_rate_limit_error, parse_claude_event};
+pub use parse::{is_rate_limit_error, parse_claude_event, parse_claude_event_stateless};
 pub use session::{ClaudeSession, ClaudeSessionOptions};
 pub use validate::{validate_claude_cli, validate_model, VALID_MODELS};
 

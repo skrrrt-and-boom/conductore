@@ -57,7 +57,7 @@ pub struct OrchestraState {
     pub tasks: Vec<Task>,
     pub plan: Option<Plan>,
     pub phases: Vec<Phase>,
-    pub current_phase_index: i32,
+    pub current_phase_index: Option<usize>,
     pub musicians: Vec<MusicianState>,
     pub analysts: Vec<AnalystState>,
     pub analysis_results: Vec<AnalysisResult>,
@@ -80,7 +80,7 @@ impl OrchestraState {
             tasks: Vec::new(),
             plan: None,
             phases: Vec::new(),
-            current_phase_index: -1,
+            current_phase_index: None,
             musicians: Vec::new(),
             analysts: Vec::new(),
             analysis_results: Vec::new(),
@@ -508,7 +508,7 @@ pub struct SessionData {
     pub last_updated_at: String,
     pub tasks: Vec<Task>,
     pub phases: Option<Vec<Phase>>,
-    pub current_phase_index: Option<i32>,
+    pub current_phase_index: Option<usize>,
     pub worktree_state: Option<Vec<WorktreeSnapshot>>,
 }
 
@@ -641,7 +641,7 @@ mod tests {
     fn orchestra_state_new_defaults() {
         let state = OrchestraState::new(sample_config());
         assert_eq!(state.phase, OrchestraPhase::Init);
-        assert_eq!(state.current_phase_index, -1);
+        assert_eq!(state.current_phase_index, None);
         assert!(state.tasks.is_empty());
         assert!(state.musicians.is_empty());
     }

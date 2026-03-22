@@ -24,9 +24,36 @@ pub fn empty_event(event_type: ClaudeEventType) -> ClaudeEvent {
 ///
 /// Assistant messages can contain multiple content blocks (thinking, text, tool_use),
 /// so one raw JSON object may expand to several events.
-pub fn parse_claude_event(raw: &Value) -> Vec<ClaudeEvent> {
+///
+/// `session_id` is an in/out parameter: when a "system" event carries a session_id,
+/// it is stored here and propagated to all subsequent events.
+pub fn parse_claude_event(raw: &Value, session_id: &mut Option<String>) -> Vec<ClaudeEvent> {
     let type_str = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
+    let mut events = parse_claude_event_inner(raw, type_str);
+
+    // Capture session_id from system events; propagate to all events
+    if type_str == "system" {
+        if let Some(sid) = raw.get("session_id").and_then(|v| v.as_str()) {
+            *session_id = Some(sid.to_string());
+        }
+    }
+    for ev in &mut events {
+        if ev.session_id.is_none() {
+            ev.session_id = session_id.clone();
+        }
+    }
+
+    events
+}
+
+/// Backwards-compatible version without session_id tracking.
+pub fn parse_claude_event_stateless(raw: &Value) -> Vec<ClaudeEvent> {
+    let mut sid = None;
+    parse_claude_event(raw, &mut sid)
+}
+
+fn parse_claude_event_inner(raw: &Value, type_str: &str) -> Vec<ClaudeEvent> {
     match type_str {
         "system" => {
             let mut ev = empty_event(ClaudeEventType::System);
@@ -159,7 +186,7 @@ mod tests {
     #[test]
     fn parse_system_event() {
         let raw = json!({"type": "system", "subtype": "init", "session_id": "sess-123"});
-        let events = parse_claude_event(&raw);
+        let events = parse_claude_event_stateless(&raw);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, ClaudeEventType::System);
         assert_eq!(events[0].subtype.as_deref(), Some("init"));
@@ -172,7 +199,7 @@ mod tests {
             "type": "assistant",
             "message": {"content": [{"type": "text", "text": "Hello world"}]}
         });
-        let events = parse_claude_event(&raw);
+        let events = parse_claude_event_stateless(&raw);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, ClaudeEventType::Assistant);
         assert_eq!(events[0].subtype.as_deref(), Some("text"));
@@ -188,7 +215,7 @@ mod tests {
                 {"type": "tool_use", "name": "Read", "input": {"path": "/tmp/file"}}
             ]}
         });
-        let events = parse_claude_event(&raw);
+        let events = parse_claude_event_stateless(&raw);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, ClaudeEventType::Assistant);
         assert_eq!(events[1].event_type, ClaudeEventType::ToolUse);
@@ -201,7 +228,7 @@ mod tests {
             "type": "assistant",
             "message": {"content": [{"type": "thinking", "thinking": "Let me consider..."}]}
         });
-        let events = parse_claude_event(&raw);
+        let events = parse_claude_event_stateless(&raw);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].subtype.as_deref(), Some("thinking"));
         assert_eq!(events[0].message.as_deref(), Some("[Thinking...]"));
@@ -215,7 +242,7 @@ mod tests {
                 {"type": "tool_use", "name": "Write", "input": {"path": "/tmp/out", "content": "hi"}}
             ]}
         });
-        let events = parse_claude_event(&raw);
+        let events = parse_claude_event_stateless(&raw);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, ClaudeEventType::ToolUse);
         assert_eq!(events[0].tool_name.as_deref(), Some("Write"));
@@ -225,7 +252,7 @@ mod tests {
     #[test]
     fn parse_tool_result() {
         let raw = json!({"type": "user", "tool_use_result": {"stdout": "file contents here"}});
-        let events = parse_claude_event(&raw);
+        let events = parse_claude_event_stateless(&raw);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, ClaudeEventType::ToolResult);
         assert_eq!(
@@ -245,7 +272,7 @@ mod tests {
             "num_turns": 3,
             "is_error": false
         });
-        let events = parse_claude_event(&raw);
+        let events = parse_claude_event_stateless(&raw);
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.event_type, ClaudeEventType::Result);
@@ -265,7 +292,7 @@ mod tests {
                 "resetsAt": 1700000000
             }
         });
-        let events = parse_claude_event(&raw);
+        let events = parse_claude_event_stateless(&raw);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, ClaudeEventType::Error);
         assert_eq!(events[0].subtype.as_deref(), Some("rate_limit"));
@@ -279,7 +306,7 @@ mod tests {
             "type": "rate_limit_event",
             "rate_limit_info": {"status": "ok"}
         });
-        let events = parse_claude_event(&raw);
+        let events = parse_claude_event_stateless(&raw);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, ClaudeEventType::System);
         assert_eq!(events[0].subtype.as_deref(), Some("rate_limit_info"));
@@ -288,7 +315,7 @@ mod tests {
     #[test]
     fn parse_unknown_type() {
         let raw = json!({"type": "banana"});
-        let events = parse_claude_event(&raw);
+        let events = parse_claude_event_stateless(&raw);
         assert!(events.is_empty());
     }
 
@@ -300,5 +327,29 @@ mod tests {
         assert!(is_rate_limit_error("rate_limit_error"));
         assert!(!is_rate_limit_error("normal error message"));
         assert!(!is_rate_limit_error(""));
+    }
+
+    #[test]
+    fn session_id_propagated_to_subsequent_events() {
+        let mut sid = None;
+
+        // System event sets session_id
+        let system = json!({"type": "system", "subtype": "init", "session_id": "sess-42"});
+        let events = parse_claude_event(&system, &mut sid);
+        assert_eq!(events[0].session_id.as_deref(), Some("sess-42"));
+        assert_eq!(sid.as_deref(), Some("sess-42"));
+
+        // Subsequent assistant event inherits session_id
+        let assistant = json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "hi"}]}
+        });
+        let events = parse_claude_event(&assistant, &mut sid);
+        assert_eq!(events[0].session_id.as_deref(), Some("sess-42"));
+
+        // Tool result also inherits
+        let tool = json!({"type": "user", "tool_use_result": {"stdout": "ok"}});
+        let events = parse_claude_event(&tool, &mut sid);
+        assert_eq!(events[0].session_id.as_deref(), Some("sess-42"));
     }
 }
