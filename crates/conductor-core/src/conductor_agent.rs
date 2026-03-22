@@ -470,6 +470,7 @@ impl ConductorAgent {
         let event_rx = self.event_rx.as_mut().unwrap();
         let event_tx = self.event_tx.clone();
         let mut full_output = String::new();
+        let mut in_json_block = false;
 
         let timeout = tokio::time::Duration::from_secs(300); // 5 minutes
         let deadline = tokio::time::Instant::now() + timeout;
@@ -526,9 +527,24 @@ impl ConductorAgent {
                         full_output.push_str(msg);
                         for line in msg.lines() {
                             let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                Self::emit(&event_tx, trimmed);
+                            if trimmed.is_empty() {
+                                continue;
                             }
+                            // Suppress JSON block lines from TUI display
+                            if trimmed == "```json" || trimmed.starts_with("```json") {
+                                in_json_block = true;
+                                continue;
+                            }
+                            if trimmed == "```" {
+                                if in_json_block {
+                                    in_json_block = false;
+                                }
+                                continue;
+                            }
+                            if in_json_block {
+                                continue;
+                            }
+                            Self::emit(&event_tx, trimmed);
                         }
                     }
                 }
@@ -671,10 +687,24 @@ fn split_markdown_sections(content: &str) -> Vec<&str> {
 /// Extract a JSON block from LLM output.
 /// First tries ```json fences, then falls back to brace scanning.
 pub fn extract_json_block(text: &str) -> Option<&str> {
-    // Try ```json ... ```
-    if let Some(start) = text.find("```json") {
-        let json_start = start + 7; // skip "```json"
-        // Skip optional whitespace/newline after ```json
+    // Try ```json ... ``` first, then plain ``` ... ```
+    let fence_start = text.find("```json").map(|s| (s, 7)).or_else(|| {
+        // Find a plain ``` fence whose content starts with { or [
+        let mut search_from = 0;
+        loop {
+            let pos = text[search_from..].find("```")?;
+            let abs_pos = search_from + pos;
+            let after = &text[abs_pos + 3..];
+            let trimmed = after.trim_start();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                return Some((abs_pos, 3));
+            }
+            search_from = abs_pos + 3;
+        }
+    });
+    if let Some((start, skip)) = fence_start {
+        let json_start = start + skip;
+        // Skip optional whitespace/newline after fence
         let json_start = text[json_start..]
             .find(|c: char| !c.is_whitespace() || c == '{' || c == '[')
             .map(|i| json_start + i)
@@ -1838,6 +1868,21 @@ mod tests {
     #[test]
     fn extract_json_block_none() {
         assert!(extract_json_block("no json here").is_none());
+    }
+
+    #[test]
+    fn extract_json_block_plain_fence() {
+        let text = "Here is the result:\n```\n{\"summary\": \"test\", \"modules\": []}\n```\nDone.";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, r#"{"summary": "test", "modules": []}"#);
+    }
+
+    #[test]
+    fn extract_json_block_plain_fence_skips_non_json() {
+        // Plain fence with non-JSON content should be skipped, second fence has JSON
+        let text = "```\nsome code\n```\n\n```\n{\"key\": \"value\"}\n```";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, r#"{"key": "value"}"#);
     }
 
     #[test]
