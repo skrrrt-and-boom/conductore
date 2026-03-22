@@ -172,7 +172,7 @@ pub fn render_session_browser(
     sessions: &[SessionData],
     selected: usize,
 ) {
-    let popup = centered_rect(70, 70, area);
+    let popup = centered_rect(80, 70, area);
     clear_area(f, popup);
 
     let block = Block::default()
@@ -189,8 +189,11 @@ pub fn render_session_browser(
         return;
     }
 
-    let header = Row::new(["ID", "Phase", "Tasks"])
+    let header = Row::new(["ID", "Prompt", "Phase", "Tasks"])
         .style(Style::default().fg(C_DIM).add_modifier(Modifier::BOLD));
+
+    // Max width for prompt column (fill remaining space)
+    let prompt_width = inner.width.saturating_sub(10 + 16 + 6 + 6) as usize; // ID + Phase + Tasks + spacing
 
     let rows: Vec<Row> = sessions
         .iter()
@@ -202,8 +205,16 @@ pub fn render_session_browser(
                 Style::default().fg(C_TEXT)
             };
 
+            // Show first line of task description as prompt
+            let prompt = s.config.task_description
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim();
+
             Row::new([
                 theme::trunc(&s.id, 8),
+                theme::trunc(prompt, prompt_width),
                 format!("{:?}", s.phase),
                 format!("{}", s.tasks.len()),
             ])
@@ -213,7 +224,8 @@ pub fn render_session_browser(
 
     let widths = [
         Constraint::Length(10),
-        Constraint::Length(14),
+        Constraint::Min(20),
+        Constraint::Length(16),
         Constraint::Length(6),
     ];
 

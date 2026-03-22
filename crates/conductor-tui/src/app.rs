@@ -71,6 +71,8 @@ pub struct UiState {
     pub sessions: Vec<SessionData>,
     /// Tracks whether the last key was Esc (for ESC+char sequences from Option keys).
     pub last_was_esc: bool,
+    /// Force a full terminal clear on the next frame (after closing overlays).
+    pub needs_clear: bool,
 }
 
 impl UiState {
@@ -93,6 +95,7 @@ impl UiState {
             session_selected: 0,
             sessions: Vec::new(),
             last_was_esc: false,
+            needs_clear: false,
         }
     }
 }
@@ -191,6 +194,10 @@ impl TuiApp {
                 ui.plan_selected = 0;
             }
 
+            if ui.needs_clear {
+                terminal.clear()?;
+                ui.needs_clear = false;
+            }
             terminal.draw(|f| render_all(f, &state, ui))?;
 
             // Wait for either a state change or terminal event.
@@ -276,13 +283,25 @@ impl TuiApp {
         if ui.show_help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')) {
                 ui.show_help = false;
+                ui.needs_clear = true;
             }
             return Ok(false);
         }
 
         if ui.show_sessions {
             match key.code {
-                KeyCode::Esc => ui.show_sessions = false,
+                KeyCode::Esc => {
+                    ui.show_sessions = false;
+                    ui.needs_clear = true;
+                }
+                KeyCode::Enter => {
+                    if let Some(session) = ui.sessions.get(ui.session_selected) {
+                        let session_id = session.id.clone();
+                        ui.show_sessions = false;
+                        ui.needs_clear = true;
+                        let _ = self.action_tx.send(UserAction::ResumeSession { session_id }).await;
+                    }
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     ui.session_selected = ui.session_selected.saturating_sub(1);
                 }
@@ -298,7 +317,10 @@ impl TuiApp {
 
         if ui.show_task_detail.is_some() {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => ui.show_task_detail = None,
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    ui.show_task_detail = None;
+                    ui.needs_clear = true;
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     ui.scroll_offset = ui.scroll_offset.saturating_sub(1);
                 }
@@ -330,10 +352,11 @@ impl TuiApp {
         }
 
         // Prompt input mode — when user is typing or browsing history
+        // Up/Down only enter prompt mode if already typing or browsing history,
+        // so that bare Up/Down scrolls the chat panel instead.
         let in_prompt_mode = !ui.prompt_input.is_empty()
             || ui.history_index.is_some()
-            || (matches!(key.code, KeyCode::Char(_)) && !is_navigation_key(&key))
-            || (key.code == KeyCode::Up && !ui.prompt_history.is_empty());
+            || (matches!(key.code, KeyCode::Char(_)) && !is_navigation_key(&key));
         if in_prompt_mode {
             match key.code {
                 KeyCode::Enter => {
@@ -360,7 +383,11 @@ impl TuiApp {
                             }
                             "/sessions" | "/list" => {
                                 if let Ok(sessions) = TaskStore::list_sessions().await {
-                                    ui.sessions = sessions;
+                                    // Filter to real sessions (have a prompt / got past Init)
+                                    ui.sessions = sessions
+                                        .into_iter()
+                                        .filter(|s| !s.config.task_description.trim().is_empty())
+                                        .collect();
                                 }
                                 ui.show_sessions = true;
                                 ui.session_selected = 0;
@@ -374,7 +401,10 @@ impl TuiApp {
                                 if arg.is_empty() {
                                     // Show sessions so user can pick one
                                     if let Ok(sessions) = TaskStore::list_sessions().await {
-                                        ui.sessions = sessions;
+                                        ui.sessions = sessions
+                                            .into_iter()
+                                            .filter(|s| !s.config.task_description.trim().is_empty())
+                                            .collect();
                                     }
                                     ui.show_sessions = true;
                                     ui.session_selected = 0;

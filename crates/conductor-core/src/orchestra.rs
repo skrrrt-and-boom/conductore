@@ -531,6 +531,19 @@ impl Orchestra {
                 self.active_start_times.remove(&musician_id);
                 self.guidance_channels.remove(&musician_id);
 
+                // Update musician status immediately from the result — don't wait
+                // for the separate MusicianStatusChange event, which would arrive
+                // on the next select! iteration and cause a race where
+                // sync_task_results() can't transition the task (status still Running)
+                // while active_musicians is already empty, triggering the stuck check.
+                if let Some(idx) = self.musician_states.iter().position(|m| m.id == musician_id) {
+                    self.musician_states[idx].status = if result.success {
+                        MusicianStatus::Completed
+                    } else {
+                        MusicianStatus::Failed
+                    };
+                }
+
                 // Store result in the matching task
                 if let Some(ms) = self.musician_states.iter().find(|m| m.id == musician_id) {
                     if let Some(ref task) = ms.current_task {
@@ -596,7 +609,34 @@ impl Orchestra {
                 }
             }
             UserAction::ResumeSession { session_id } => {
-                tracing::info!(session_id = %session_id, "resume requested — use `conductor resume -s {session_id}` to resume a session");
+                if self.phase == OrchestraPhase::Init {
+                    // Load the previous session and re-submit its task
+                    match TaskStore::resolve_id(&session_id).await {
+                        Some(resolved) => {
+                            let store = TaskStore::new(&resolved);
+                            match store.load_session().await {
+                                Ok(Some(prev)) => {
+                                    self.config.task_description = prev.config.task_description;
+                                    self.config.reference_session_id = Some(resolved.clone());
+                                    tracing::info!(session_id = %resolved, "resuming session");
+                                    if let Err(e) = self.do_plan().await {
+                                        tracing::error!(error = %e, "planning failed");
+                                        self.set_phase(OrchestraPhase::Failed);
+                                    }
+                                }
+                                Ok(None) => {
+                                    self.push_conductor_output(&format!("Session '{session_id}' not found"));
+                                }
+                                Err(e) => {
+                                    self.push_conductor_output(&format!("Failed to load session: {e}"));
+                                }
+                            }
+                        }
+                        None => {
+                            self.push_conductor_output(&format!("Session '{session_id}' not found or ambiguous"));
+                        }
+                    }
+                }
             }
             _ => {
                 // FocusNext, FocusPrev, Scroll, Resize, etc. — TUI handles these locally
@@ -617,6 +657,14 @@ impl Orchestra {
     /// sync memory, and process queued guidance.
     async fn tick(&mut self) {
         let now = std::time::Instant::now();
+
+        // Update elapsed_ms for all active musicians so timers stay fresh
+        for (id, start) in &self.active_start_times {
+            if let Some(ms) = self.musician_states.iter_mut().find(|m| m.id == *id) {
+                ms.elapsed_ms = now.duration_since(*start).as_millis() as u64;
+            }
+        }
+
         let mut stuck_ids = Vec::new();
         for (id, start) in &self.active_start_times {
             if now.duration_since(*start).as_millis() as u64 > MUSICIAN_TIMEOUT_MS {
@@ -732,14 +780,22 @@ impl Orchestra {
                 } else {
                     conductor.decompose_phases(&task_desc).await
                 };
+                // On JSON parse failure, retry once with a nudge prompt
+                let result = match result {
+                    Err(CoreError::JsonParse { .. }) => {
+                        tracing::warn!("decomposition JSON parse failed, retrying...");
+                        conductor.retry_decompose().await
+                    }
+                    other => other,
+                };
                 (conductor, result)
             })
         }).await;
 
         let decomposition = match decomposition {
             Ok(d) => d,
-            Err(CoreError::JsonParse { raw_output, .. }) => {
-                // Claude responded conversationally without a plan.
+            Err(CoreError::JsonParse { .. }) => {
+                // Claude responded conversationally without a plan even after retry.
                 // The response is already visible in conductor output (streamed via emit).
                 // Show it cleanly and complete — nothing to execute.
                 self.push_conductor_output("");
@@ -748,11 +804,7 @@ impl Orchestra {
                 self.set_phase(OrchestraPhase::Complete);
                 self.broadcast_state();
                 let _ = self.persist_state().await;
-                // Return the raw output for headless mode stderr display
-                return Err(CoreError::JsonParse {
-                    reason: "No actionable plan produced".into(),
-                    raw_output,
-                });
+                return Ok(());
             }
             Err(e) => {
                 self.push_conductor_output(&format!("Decomposition failed: {e}"));
@@ -1136,6 +1188,16 @@ impl Orchestra {
             tokio::select! {
                 Some(event) = event_rx.recv() => {
                     self.handle_event(event).await;
+                    // Drain any additional pending events before top-of-loop checks.
+                    // This ensures paired events (e.g. MusicianComplete followed by
+                    // MusicianStatusChange) are processed together, preventing the
+                    // stuck-state check from firing between them.
+                    while let Ok(event) = event_rx.try_recv() {
+                        self.handle_event(event).await;
+                    }
+                    self.drain_musician_returns();
+                    self.sync_task_results().await;
+                    needs_assignment = true;
                     self.broadcast_state();
                 }
                 Some(action) = action_rx.recv() => {

@@ -190,6 +190,16 @@ impl ConductorAgent {
         parse_decompose_result(&output)
     }
 
+    /// Retry decomposition in the same session by nudging the LLM to produce valid JSON.
+    pub async fn retry_decompose(&mut self) -> Result<DecomposeResult, CoreError> {
+        self.ensure_session()?;
+        let prompt = "Your previous response could not be parsed as JSON. \
+            Please respond ONLY with the JSON plan object as specified in the earlier instructions. \
+            Use ```json fences. Do not include any other text outside the JSON block.";
+        let output = self.send_and_collect(prompt).await?;
+        parse_decompose_result(&output)
+    }
+
     /// Phase 3: Detail a specific phase's tasks.
     pub async fn detail_phase(
         &mut self,

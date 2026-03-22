@@ -57,17 +57,48 @@ pub fn render_prompt_bar(
         vec![Span::styled(input_text, Style::default().fg(C_TEXT))]
     };
 
+    // Calculate horizontal scroll offset so the cursor stays visible
+    let prefix_display = format!(" {prefix}> ");
+    let prefix_w = UnicodeWidthStr::width(prefix_display.as_str()) as u16;
+    let visible_width = area.width.saturating_sub(prefix_w);
+    let input_before_cursor = &input_text[..cursor_pos.min(input_text.len())];
+    let cursor_col = UnicodeWidthStr::width(input_before_cursor) as u16;
+
+    // Scroll the input text so the cursor is always within the visible area
+    let h_scroll = if cursor_col >= visible_width {
+        (cursor_col - visible_width + 1) as usize
+    } else {
+        0
+    };
+
+    // Slice the input text to the visible window (char-aware)
+    let visible_input: String = input_text
+        .chars()
+        .scan(0usize, |w, c| {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            *w += cw;
+            Some((*w, c))
+        })
+        .skip_while(|&(w, _)| w <= h_scroll)
+        .map(|(_, c)| c)
+        .collect();
+
+    // Rebuild input spans on the visible portion
+    let visible_spans = if input_text.starts_with('/') && h_scroll == 0 {
+        // Re-use existing highlighting logic only when not scrolled (command is visible)
+        input_spans.iter().map(|s| s.clone()).collect::<Vec<_>>()
+    } else {
+        vec![Span::styled(&visible_input, Style::default().fg(C_TEXT))]
+    };
+
     let mut spans = vec![prefix_span];
-    spans.extend(input_spans);
+    spans.extend(visible_spans);
 
     let prompt = Paragraph::new(Line::from(spans));
     f.render_widget(prompt, area);
 
-    // Show cursor position (use display width, not byte length)
-    let prefix_display = format!(" {prefix}> ");
-    let input_before_cursor = &input_text[..cursor_pos.min(input_text.len())];
-    let cursor_x = area.x + UnicodeWidthStr::width(prefix_display.as_str()) as u16
-        + UnicodeWidthStr::width(input_before_cursor) as u16;
+    // Show cursor position accounting for horizontal scroll
+    let cursor_x = area.x + prefix_w + cursor_col.saturating_sub(h_scroll as u16);
     if cursor_x < area.x + area.width {
         f.set_cursor_position((cursor_x, area.y));
     }

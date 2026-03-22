@@ -147,7 +147,13 @@ fn render_musician_column(
         })
         .collect();
 
-    let output = Paragraph::new(lines).scroll((scroll_offset, 0));
+    // Auto-scroll to bottom when scroll_offset is 0 (default/no manual scroll)
+    let effective_scroll = if scroll_offset == 0 {
+        total_lines.saturating_sub(output_height as usize) as u16
+    } else {
+        scroll_offset
+    };
+    let output = Paragraph::new(lines).scroll((effective_scroll, 0));
     f.render_widget(output, output_area);
 
     // Stats line: elapsed
