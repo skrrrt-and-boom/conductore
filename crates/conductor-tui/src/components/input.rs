@@ -75,6 +75,10 @@ pub fn render_keyboard_help(f: &mut Frame, area: Rect) {
         Row::new(["d", "Task detail (in plan review)"]),
         Row::new(["q / Ctrl+C", "Quit"]),
         Row::new(["", ""]),
+        Row::new(["Opt+← / Opt+→", "Jump word left / right"]),
+        Row::new(["Ctrl+W", "Delete word backward"]),
+        Row::new(["Ctrl+A / Ctrl+E", "Jump to start / end of line"]),
+        Row::new(["Ctrl+U", "Clear input line"]),
         Row::new(["Type text", "Enter guidance or plan refinement"]),
     ];
 

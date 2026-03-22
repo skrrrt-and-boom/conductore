@@ -388,8 +388,12 @@ impl Orchestra {
                     self.broadcast_state();
                 }
                 Some(action) = action_rx.recv() => {
+                    // Temporarily return event_rx so execute_loop can drain musician events.
+                    // Safe: select! drops the event_rx.recv() future, releasing the borrow.
+                    self.event_rx = Some(event_rx);
                     self.handle_action(action).await;
                     self.broadcast_state();
+                    event_rx = self.event_rx.take().expect("event_rx not returned after handle_action");
                 }
                 _ = tick.tick() => {
                     // Update elapsed time, check for stuck musicians, sync memory, process guidance

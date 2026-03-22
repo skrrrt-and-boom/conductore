@@ -17,7 +17,7 @@ use ratatui::{
 use conductor_types::{extract_image_paths, OrchestraPhase, OrchestraState, SessionData, UserAction};
 
 use crate::{
-    components::{header, input, insights, musician, panels, status},
+    components::{analyst, conductor, header, input, insights, musician, panels, status},
     layout::{get_layout_config, LayoutConfig},
 };
 
@@ -51,6 +51,8 @@ pub struct UiState {
     pub session_selected: usize,
     /// Cached session list (loaded on toggle).
     pub sessions: Vec<SessionData>,
+    /// Tracks whether the last key was Esc (for ESC+char sequences from Option keys).
+    pub last_was_esc: bool,
 }
 
 impl UiState {
@@ -69,6 +71,7 @@ impl UiState {
             plan_selected: 0,
             session_selected: 0,
             sessions: Vec::new(),
+            last_was_esc: false,
         }
     }
 }
@@ -140,13 +143,17 @@ impl TuiApp {
                     if !ready {
                         continue;
                     }
-                    if let Ok(Event::Key(key)) = event::read() {
-                        if self.handle_key(key, ui, &state).await? {
-                            break; // quit requested
+                    match event::read() {
+                        Ok(Event::Key(key)) => {
+                            if self.handle_key(key, ui, &state).await? {
+                                break; // quit requested
+                            }
                         }
-                    } else if let Ok(Event::Resize(w, h)) = event::read() {
-                        ui.layout_config = get_layout_config(w, h);
-                        let _ = self.action_tx.send(UserAction::Resize { width: w, height: h }).await;
+                        Ok(Event::Resize(w, h)) => {
+                            ui.layout_config = get_layout_config(w, h);
+                            let _ = self.action_tx.send(UserAction::Resize { width: w, height: h }).await;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -161,6 +168,44 @@ impl TuiApp {
         ui: &mut UiState,
         state: &OrchestraState,
     ) -> anyhow::Result<bool> {
+        // Detect ESC+char sequences from macOS Option key.
+        // Terminal sends Option+Left as ESC then 'b', Option+Right as ESC then 'f'.
+        if ui.last_was_esc {
+            ui.last_was_esc = false;
+            match key.code {
+                KeyCode::Char('b') => {
+                    word_left(&mut ui.prompt_cursor, &ui.prompt_input);
+                    return Ok(false);
+                }
+                KeyCode::Char('f') => {
+                    word_right(&mut ui.prompt_cursor, &ui.prompt_input);
+                    return Ok(false);
+                }
+                KeyCode::Char('d') => {
+                    word_delete_forward(&mut ui.prompt_cursor, &mut ui.prompt_input);
+                    return Ok(false);
+                }
+                _ => {
+                    // Not a recognized ESC sequence — apply the original Esc action (clear input)
+                    if !ui.prompt_input.is_empty() {
+                        ui.prompt_input.clear();
+                        ui.prompt_cursor = 0;
+                    }
+                    // Fall through to handle the current key normally
+                }
+            }
+        }
+
+        // Track Esc for ESC+char detection — only when no overlay is open
+        if key.code == KeyCode::Esc
+            && !ui.show_help
+            && !ui.show_sessions
+            && ui.show_task_detail.is_none()
+        {
+            ui.last_was_esc = true;
+            return Ok(false);
+        }
+
         // Ctrl+C always quits
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             let _ = self.action_tx.send(UserAction::Quit).await;
@@ -205,6 +250,25 @@ impl TuiApp {
             return Ok(false);
         }
 
+        // Alt+key word navigation (works regardless of prompt state)
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('b') => {
+                    word_left(&mut ui.prompt_cursor, &ui.prompt_input);
+                    return Ok(false);
+                }
+                KeyCode::Char('f') => {
+                    word_right(&mut ui.prompt_cursor, &ui.prompt_input);
+                    return Ok(false);
+                }
+                KeyCode::Char('d') => {
+                    word_delete_forward(&mut ui.prompt_cursor, &mut ui.prompt_input);
+                    return Ok(false);
+                }
+                _ => {} // Other Alt combos fall through
+            }
+        }
+
         // Prompt input mode — when user is typing
         if !ui.prompt_input.is_empty() || matches!(key.code, KeyCode::Char(_)) && !is_navigation_key(&key) {
             match key.code {
@@ -215,12 +279,9 @@ impl TuiApp {
                         self.submit_input(&text, state).await;
                     }
                 }
-                KeyCode::Esc => {
-                    ui.prompt_input.clear();
-                    ui.prompt_cursor = 0;
-                }
-                // Option+Backspace: delete word backward
-                KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                // Note: Esc is handled globally above (for ESC+char sequence detection)
+                // Ctrl+W or Ctrl+Backspace: delete word backward
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if ui.prompt_cursor > 0 {
                         let old_cursor = ui.prompt_cursor;
                         while ui.prompt_cursor > 0
@@ -242,35 +303,21 @@ impl TuiApp {
                         ui.prompt_input.remove(ui.prompt_cursor);
                     }
                 }
-                // Option+Left: jump word left
-                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
-                    while ui.prompt_cursor > 0
-                        && ui.prompt_input.as_bytes()[ui.prompt_cursor - 1] == b' '
-                    {
-                        ui.prompt_cursor -= 1;
-                    }
-                    while ui.prompt_cursor > 0
-                        && ui.prompt_input.as_bytes()[ui.prompt_cursor - 1] != b' '
-                    {
-                        ui.prompt_cursor -= 1;
-                    }
+                // Ctrl+A: jump to start of line
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    ui.prompt_cursor = 0;
+                }
+                // Ctrl+E: jump to end of line
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    ui.prompt_cursor = ui.prompt_input.len();
+                }
+                // Ctrl+U: clear line
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    ui.prompt_input.clear();
+                    ui.prompt_cursor = 0;
                 }
                 KeyCode::Left => {
                     ui.prompt_cursor = ui.prompt_cursor.saturating_sub(1);
-                }
-                // Option+Right: jump word right
-                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
-                    let len = ui.prompt_input.len();
-                    while ui.prompt_cursor < len
-                        && ui.prompt_input.as_bytes()[ui.prompt_cursor] != b' '
-                    {
-                        ui.prompt_cursor += 1;
-                    }
-                    while ui.prompt_cursor < len
-                        && ui.prompt_input.as_bytes()[ui.prompt_cursor] == b' '
-                    {
-                        ui.prompt_cursor += 1;
-                    }
                 }
                 KeyCode::Right => {
                     if ui.prompt_cursor < ui.prompt_input.len() {
@@ -403,6 +450,44 @@ fn is_navigation_key(key: &KeyEvent) -> bool {
             | KeyCode::Char('j')
             | KeyCode::Char('k')
     ) || key.modifiers.contains(KeyModifiers::CONTROL)
+      || key.modifiers.contains(KeyModifiers::ALT)
+}
+
+// ─── Word Navigation Helpers ─────────────────────────────────────────────────
+
+fn word_left(cursor: &mut usize, input: &str) {
+    let bytes = input.as_bytes();
+    while *cursor > 0 && bytes.get(*cursor - 1) == Some(&b' ') {
+        *cursor -= 1;
+    }
+    while *cursor > 0 && bytes.get(*cursor - 1) != Some(&b' ') {
+        *cursor -= 1;
+    }
+}
+
+fn word_right(cursor: &mut usize, input: &str) {
+    let len = input.len();
+    let bytes = input.as_bytes();
+    while *cursor < len && bytes[*cursor] != b' ' {
+        *cursor += 1;
+    }
+    while *cursor < len && bytes[*cursor] == b' ' {
+        *cursor += 1;
+    }
+}
+
+fn word_delete_forward(cursor: &mut usize, input: &mut String) {
+    let len = input.len();
+    let start = *cursor;
+    let bytes = input.as_bytes();
+    let mut end = start;
+    while end < len && bytes[end] != b' ' {
+        end += 1;
+    }
+    while end < len && bytes[end] == b' ' {
+        end += 1;
+    }
+    input.drain(start..end);
 }
 
 /// Polls crossterm for an event with a 50ms timeout. Returns true if an event is ready.
@@ -459,7 +544,7 @@ pub fn render_all(f: &mut Frame, state: &OrchestraState, ui: &UiState) {
     }
 }
 
-/// Render the main content area (musicians + insights).
+/// Render the main content area based on current phase.
 fn render_content(f: &mut Frame, area: Rect, state: &OrchestraState, ui: &UiState) {
     // During PlanReview, show the plan review panel instead of musicians
     if state.phase == OrchestraPhase::PlanReview {
@@ -474,7 +559,19 @@ fn render_content(f: &mut Frame, area: Rect, state: &OrchestraState, ui: &UiStat
         return;
     }
 
-    if ui.layout_config.show_insights_panel && ui.show_insights {
+    // Planning phases: show conductor output (no musicians exist yet)
+    let is_planning = matches!(
+        state.phase,
+        OrchestraPhase::Init
+            | OrchestraPhase::Planning
+            | OrchestraPhase::Exploring
+            | OrchestraPhase::Analyzing
+            | OrchestraPhase::Decomposing
+    ) && state.musicians.is_empty();
+
+    if is_planning {
+        render_planning_content(f, area, state, ui);
+    } else if ui.layout_config.show_insights_panel && ui.show_insights {
         // Horizontal split: musicians | insights
         let content_chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -488,6 +585,61 @@ fn render_content(f: &mut Frame, area: Rect, state: &OrchestraState, ui: &UiStat
         insights::render_insight_panel(f, content_chunks[1], &state.insights);
     } else {
         render_musicians(f, area, state, ui);
+    }
+}
+
+/// Render content during planning phases (conductor output + optional analysts).
+fn render_planning_content(f: &mut Frame, area: Rect, state: &OrchestraState, ui: &UiState) {
+    let phase_label = format!("{:?}", state.phase);
+
+    if ui.layout_config.show_insights_panel && ui.show_insights {
+        let content_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(20),
+                Constraint::Length(ui.layout_config.insights_panel_width),
+            ])
+            .split(area);
+
+        render_planning_main(f, content_chunks[0], state, ui, &phase_label);
+        insights::render_insight_panel(f, content_chunks[1], &state.insights);
+    } else {
+        render_planning_main(f, area, state, ui, &phase_label);
+    }
+}
+
+/// Render the main area during planning: conductor output, with analyst grid below if analyzing.
+fn render_planning_main(
+    f: &mut Frame,
+    area: Rect,
+    state: &OrchestraState,
+    ui: &UiState,
+    phase_label: &str,
+) {
+    if !state.analysts.is_empty() && state.phase == OrchestraPhase::Analyzing {
+        // Split: conductor output on top, analyst grid below
+        let conductor_height = (area.height / 3).max(5);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(conductor_height), Constraint::Min(3)])
+            .split(area);
+
+        conductor::render_conductor_output(
+            f,
+            chunks[0],
+            &state.conductor_output,
+            phase_label,
+            ui.scroll_offset,
+        );
+        analyst::render_analyst_grid(f, chunks[1], &state.analysts, &ui.layout_config);
+    } else {
+        conductor::render_conductor_output(
+            f,
+            area,
+            &state.conductor_output,
+            phase_label,
+            ui.scroll_offset,
+        );
     }
 }
 
