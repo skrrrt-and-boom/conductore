@@ -304,10 +304,13 @@ async fn run_interactive(
 
     info!(session_id = %session_id, "Starting interactive session");
 
-    let (mut orchestra, _state_rx, _action_tx) = Orchestra::new(config);
+    let (mut orchestra, state_rx, action_tx) = Orchestra::new(config);
 
-    // TODO: integrate TuiApp when conductor-tui is implemented
-    // For now, run the orchestra directly and handle ctrl_c for shutdown.
+    // TuiApp is Send (holds watch::Receiver + mpsc::Sender), so it can be spawned.
+    // Orchestra is !Send, so it must run inline on the current task.
+    let mut tui = conductor_tui::app::TuiApp::new(state_rx, action_tx);
+    let tui_handle = tokio::spawn(async move { tui.run().await });
+    let abort_handle = tui_handle.abort_handle();
 
     tokio::select! {
         result = async {
@@ -319,8 +322,15 @@ async fn run_interactive(
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl-C, shutting down");
         }
+        tui_result = tui_handle => {
+            // TUI exited (user pressed q or error)
+            if let Ok(Err(e)) = tui_result {
+                return Err(e);
+            }
+        }
     }
 
+    abort_handle.abort();
     Ok(())
 }
 
