@@ -61,6 +61,7 @@ pub enum UserAction {
         text: String,
         images: Option<Vec<String>>,
     },
+    ResumeSession { session_id: String },
     Resize { width: u16, height: u16 },
     ScrollUp,
     ScrollDown,

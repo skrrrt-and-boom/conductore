@@ -314,6 +314,7 @@ name = "conductor-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "conductor-core",
  "conductor-types",
  "crossterm 0.28.1",
  "ratatui",

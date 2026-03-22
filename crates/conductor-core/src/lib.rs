@@ -10,6 +10,7 @@ pub mod insights;
 pub mod memory;
 pub mod musician;
 pub mod orchestra;
+pub mod prompt_history;
 pub mod rate_limiter;
 pub mod task_store;
 pub mod tool_summary;

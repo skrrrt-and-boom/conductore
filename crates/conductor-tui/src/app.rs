@@ -7,6 +7,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
+use tokio::sync::mpsc;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     prelude::CrosstermBackend,
@@ -14,7 +15,18 @@ use ratatui::{
     Frame, Terminal,
 };
 
+use conductor_core::{prompt_history, task_store::TaskStore};
 use conductor_types::{extract_image_paths, OrchestraPhase, OrchestraState, SessionData, UserAction};
+
+/// Available slash commands for autocomplete and highlighting.
+pub const SLASH_COMMANDS: &[&str] = &[
+    "/help",
+    "/sessions",
+    "/list",
+    "/resume",
+    "/quit",
+    "/q",
+];
 
 use crate::{
     components::{analyst, conductor, header, input, insights, musician, panels, status},
@@ -41,6 +53,12 @@ pub struct UiState {
     pub prompt_input: String,
     /// Cursor position within prompt_input.
     pub prompt_cursor: usize,
+    /// History of submitted prompts (oldest first).
+    pub prompt_history: Vec<String>,
+    /// Current position in history when cycling (None = not browsing history).
+    pub history_index: Option<usize>,
+    /// Stashed input before history browsing started.
+    pub history_stash: String,
     /// Single-musician expanded view (full-width).
     pub focus_mode: bool,
     /// Cached layout config from last terminal resize.
@@ -66,6 +84,9 @@ impl UiState {
             show_task_detail: None,
             prompt_input: String::new(),
             prompt_cursor: 0,
+            prompt_history: Vec::new(),
+            history_index: None,
+            history_stash: String::new(),
             focus_mode: false,
             layout_config: get_layout_config(width, height),
             plan_selected: 0,
@@ -105,6 +126,11 @@ impl TuiApp {
         let size = terminal.size()?;
         let mut ui = UiState::new(size.width, size.height);
 
+        // Load persistent prompt history from disk
+        if let Ok(history) = prompt_history::load_history().await {
+            ui.prompt_history = history;
+        }
+
         let result = self.event_loop(&mut terminal, &mut ui).await;
 
         // Restore terminal — always runs even on error
@@ -119,6 +145,35 @@ impl TuiApp {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
         ui: &mut UiState,
+    ) -> anyhow::Result<()> {
+        // Spawn a dedicated keyboard reader task to avoid input starvation.
+        // Without this, state_rx.changed() wins the select! race during active
+        // execution (musicians produce output constantly), dropping keyboard events.
+        let (term_tx, mut term_rx) = mpsc::channel::<Event>(64);
+        let reader_handle = tokio::task::spawn_blocking(move || {
+            loop {
+                match event::read() {
+                    Ok(evt) => {
+                        if term_tx.blocking_send(evt).is_err() {
+                            break; // receiver dropped, TUI shutting down
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let result = self.event_loop_inner(terminal, ui, &mut term_rx).await;
+
+        reader_handle.abort();
+        result
+    }
+
+    async fn event_loop_inner(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        ui: &mut UiState,
+        term_rx: &mut mpsc::Receiver<Event>,
     ) -> anyhow::Result<()> {
         loop {
             // Draw current state
@@ -138,31 +193,21 @@ impl TuiApp {
 
             terminal.draw(|f| render_all(f, &state, ui))?;
 
-            // Check for terminal completion
-            if matches!(
-                state.phase,
-                OrchestraPhase::Complete | OrchestraPhase::Failed
-            ) {
-                // Keep rendering but don't auto-quit — user can review
-            }
-
-            // Wait for either a state change or terminal event
+            // Wait for either a state change or terminal event.
+            // Both channels are independent — neither can starve the other.
             tokio::select! {
                 _ = self.state_rx.changed() => {
                     // New state available — loop will redraw
                     continue;
                 }
-                ready = poll_crossterm_event() => {
-                    if !ready {
-                        continue;
-                    }
-                    match event::read() {
-                        Ok(Event::Key(key)) => {
+                Some(evt) = term_rx.recv() => {
+                    match evt {
+                        Event::Key(key) => {
                             if self.handle_key(key, ui, &state).await? {
                                 break; // quit requested
                             }
                         }
-                        Ok(Event::Resize(w, h)) => {
+                        Event::Resize(w, h) => {
                             ui.layout_config = get_layout_config(w, h);
                             let _ = self.action_tx.send(UserAction::Resize { width: w, height: h }).await;
                         }
@@ -200,9 +245,11 @@ impl TuiApp {
                 }
                 _ => {
                     // Not a recognized ESC sequence — apply the original Esc action (clear input)
-                    if !ui.prompt_input.is_empty() {
+                    if !ui.prompt_input.is_empty() || ui.history_index.is_some() {
                         ui.prompt_input.clear();
                         ui.prompt_cursor = 0;
+                        ui.history_index = None;
+                        ui.history_stash.clear();
                     }
                     // Fall through to handle the current key normally
                 }
@@ -282,15 +329,102 @@ impl TuiApp {
             }
         }
 
-        // Prompt input mode — when user is typing
-        if !ui.prompt_input.is_empty() || matches!(key.code, KeyCode::Char(_)) && !is_navigation_key(&key) {
+        // Prompt input mode — when user is typing or browsing history
+        let in_prompt_mode = !ui.prompt_input.is_empty()
+            || ui.history_index.is_some()
+            || (matches!(key.code, KeyCode::Char(_)) && !is_navigation_key(&key))
+            || (key.code == KeyCode::Up && !ui.prompt_history.is_empty());
+        if in_prompt_mode {
             match key.code {
                 KeyCode::Enter => {
                     if !ui.prompt_input.is_empty() {
                         let text = std::mem::take(&mut ui.prompt_input);
                         ui.prompt_cursor = 0;
-                        self.submit_input(&text, state).await;
+                        ui.history_index = None;
+                        ui.history_stash.clear();
+
+                        // Don't save slash commands to history
+                        let trimmed = text.trim();
+                        if !trimmed.starts_with('/') {
+                            ui.prompt_history.push(text.clone());
+                            // Persist to disk (fire-and-forget)
+                            let text_clone = text.clone();
+                            tokio::spawn(async move {
+                                let _ = prompt_history::save_prompt(&text_clone).await;
+                            });
+                        }
+
+                        match trimmed {
+                            "/help" | "/?" => {
+                                ui.show_help = !ui.show_help;
+                            }
+                            "/sessions" | "/list" => {
+                                if let Ok(sessions) = TaskStore::list_sessions().await {
+                                    ui.sessions = sessions;
+                                }
+                                ui.show_sessions = true;
+                                ui.session_selected = 0;
+                            }
+                            "/quit" | "/q" => {
+                                let _ = self.action_tx.send(UserAction::Quit).await;
+                                return Ok(true);
+                            }
+                            cmd if cmd.starts_with("/resume") => {
+                                let arg = cmd.strip_prefix("/resume").unwrap().trim();
+                                if arg.is_empty() {
+                                    // Show sessions so user can pick one
+                                    if let Ok(sessions) = TaskStore::list_sessions().await {
+                                        ui.sessions = sessions;
+                                    }
+                                    ui.show_sessions = true;
+                                    ui.session_selected = 0;
+                                } else if let Some(resolved) = TaskStore::resolve_id(arg).await {
+                                    let _ = self.action_tx.send(UserAction::ResumeSession {
+                                        session_id: resolved,
+                                    }).await;
+                                }
+                            }
+                            _ => {
+                                self.submit_input(&text, state).await;
+                            }
+                        }
                     }
+                }
+                KeyCode::Up => {
+                    if !ui.prompt_history.is_empty() {
+                        let new_idx = match ui.history_index {
+                            None => {
+                                ui.history_stash = ui.prompt_input.clone();
+                                ui.prompt_history.len() - 1
+                            }
+                            Some(0) => 0,
+                            Some(i) => i - 1,
+                        };
+                        ui.history_index = Some(new_idx);
+                        ui.prompt_input = ui.prompt_history[new_idx].clone();
+                        ui.prompt_cursor = ui.prompt_input.len();
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(idx) = ui.history_index {
+                        if idx + 1 < ui.prompt_history.len() {
+                            let new_idx = idx + 1;
+                            ui.history_index = Some(new_idx);
+                            ui.prompt_input = ui.prompt_history[new_idx].clone();
+                            ui.prompt_cursor = ui.prompt_input.len();
+                        } else {
+                            ui.history_index = None;
+                            ui.prompt_input = std::mem::take(&mut ui.history_stash);
+                            ui.prompt_cursor = ui.prompt_input.len();
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    // Exit prompt/history mode — clear input and reset history browsing
+                    ui.prompt_input.clear();
+                    ui.prompt_cursor = 0;
+                    ui.history_index = None;
+                    ui.history_stash.clear();
                 }
                 // Note: Esc is handled globally above (for ESC+char sequence detection)
                 // Ctrl+W or Ctrl+Backspace: delete word backward
@@ -337,9 +471,32 @@ impl TuiApp {
                         ui.prompt_cursor += 1;
                     }
                 }
+                KeyCode::Tab => {
+                    // Autocomplete slash commands
+                    if ui.prompt_input.starts_with('/') {
+                        let input = ui.prompt_input.clone();
+                        let prefix = input.split_whitespace().next().unwrap_or(&input);
+                        let matches: Vec<&&str> = SLASH_COMMANDS
+                            .iter()
+                            .filter(|cmd| cmd.starts_with(prefix) && **cmd != prefix)
+                            .collect();
+                        if matches.len() == 1 {
+                            let completed = matches[0].to_string();
+                            // Replace the command prefix, keep any args
+                            let rest = input.strip_prefix(prefix).unwrap_or("");
+                            ui.prompt_input = if completed == "/resume" {
+                                format!("{completed} {}", rest.trim_start())
+                            } else {
+                                format!("{completed}{rest}")
+                            };
+                            ui.prompt_cursor = ui.prompt_input.len();
+                        }
+                    }
+                }
                 KeyCode::Char(c) => {
                     ui.prompt_input.insert(ui.prompt_cursor, c);
                     ui.prompt_cursor += 1;
+                    ui.history_index = None;
                 }
                 _ => {}
             }
@@ -504,6 +661,8 @@ fn word_delete_forward(cursor: &mut usize, input: &mut String) {
 }
 
 /// Polls crossterm for an event with a 50ms timeout. Returns true if an event is ready.
+/// NOTE: Kept for potential use in tests; the main event loop uses a dedicated reader task instead.
+#[allow(dead_code)]
 async fn poll_crossterm_event() -> bool {
     tokio::task::spawn_blocking(|| {
         event::poll(std::time::Duration::from_millis(50)).unwrap_or(false)

@@ -595,6 +595,9 @@ impl Orchestra {
                     let _ = tx.try_send(text.clone());
                 }
             }
+            UserAction::ResumeSession { session_id } => {
+                tracing::info!(session_id = %session_id, "resume requested — use `conductor resume -s {session_id}` to resume a session");
+            }
             _ => {
                 // FocusNext, FocusPrev, Scroll, Resize, etc. — TUI handles these locally
             }
@@ -2030,7 +2033,10 @@ impl Orchestra {
                 .iter_mut()
                 .find(|t| t.status == TaskStatus::Ready)
         };
-        task.map(|t| t.clone())
+        task.map(|t| {
+            t.status = TaskStatus::InProgress;
+            t.clone()
+        })
     }
 
     fn update_task_readiness(&mut self) {

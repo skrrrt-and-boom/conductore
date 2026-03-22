@@ -3,7 +3,7 @@
 //! Port of PromptBar.tsx + KeyboardHelpOverlay.tsx.
 
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Rect},
     style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Row, Table},
@@ -14,8 +14,8 @@ use unicode_width::UnicodeWidthStr;
 use conductor_types::OrchestraPhase;
 
 use crate::{
-    app::centered_rect,
-    theme::{C_BRAND, C_TEXT},
+    app::{centered_rect, SLASH_COMMANDS},
+    theme::{C_BRAND, C_DIM, C_READY, C_TEXT},
 };
 
 /// Render the prompt input bar at the bottom of the screen.
@@ -33,14 +33,34 @@ pub fn render_prompt_bar(
         _ => ">",
     };
 
-    let prompt = Paragraph::new(Line::from(vec![
-        Span::styled(
-            format!(" {prefix}> "),
-            Style::default().fg(C_BRAND),
-        ),
-        Span::styled(input_text, Style::default().fg(C_TEXT)),
-    ]));
+    let prefix_span = Span::styled(
+        format!(" {prefix}> "),
+        Style::default().fg(C_BRAND),
+    );
 
+    // Build input spans with command highlighting
+    let input_spans = if input_text.starts_with('/') {
+        let trimmed = input_text.trim();
+        let cmd_part = trimmed.split_whitespace().next().unwrap_or(trimmed);
+        let is_valid = SLASH_COMMANDS.contains(&cmd_part)
+            || SLASH_COMMANDS.iter().any(|c| c.starts_with(cmd_part) && cmd_part.len() > 1);
+
+        let cmd_color = if is_valid { C_READY } else { C_DIM };
+        let cmd_len = cmd_part.len().min(input_text.len());
+        let rest = &input_text[cmd_len..];
+
+        vec![
+            Span::styled(&input_text[..cmd_len], Style::default().fg(cmd_color)),
+            Span::styled(rest, Style::default().fg(C_TEXT)),
+        ]
+    } else {
+        vec![Span::styled(input_text, Style::default().fg(C_TEXT))]
+    };
+
+    let mut spans = vec![prefix_span];
+    spans.extend(input_spans);
+
+    let prompt = Paragraph::new(Line::from(spans));
     f.render_widget(prompt, area);
 
     // Show cursor position (use display width, not byte length)
@@ -55,7 +75,7 @@ pub fn render_prompt_bar(
 
 /// Render the keyboard help overlay as a centered popup.
 pub fn render_keyboard_help(f: &mut Frame, area: Rect) {
-    let popup = centered_rect(60, 60, area);
+    let popup = centered_rect(60, 70, area);
     f.render_widget(Clear, popup);
 
     let block = Block::default()
@@ -70,9 +90,9 @@ pub fn render_keyboard_help(f: &mut Frame, area: Rect) {
     f.render_widget(block, popup);
 
     let rows = vec![
-        Row::new(["Tab / Shift+Tab", "Switch musician panel"]),
+        Row::new(["Tab / Shift+Tab", "Switch panel / autocomplete cmd"]),
         Row::new(["←  →", "Previous / next musician"]),
-        Row::new(["↑  ↓", "Scroll output / navigate tasks"]),
+        Row::new(["↑  ↓", "Prompt history / scroll / navigate"]),
         Row::new(["Enter", "Approve plan / submit input"]),
         Row::new(["Esc", "Dismiss overlay / clear input"]),
         Row::new(["?", "Toggle this help"]),
@@ -83,7 +103,12 @@ pub fn render_keyboard_help(f: &mut Frame, area: Rect) {
         Row::new(["Ctrl+W", "Delete word backward"]),
         Row::new(["Ctrl+A / Ctrl+E", "Jump to start / end of line"]),
         Row::new(["Ctrl+U", "Clear input line"]),
-        Row::new(["Type text", "Enter guidance or plan refinement"]),
+        Row::new(["", ""]),
+        Row::new(["  COMMANDS", ""]).style(Style::default().fg(C_BRAND)),
+        Row::new(["/sessions", "Browse past sessions"]),
+        Row::new(["/resume <id>", "Resume a past session"]),
+        Row::new(["/help", "Toggle this help"]),
+        Row::new(["/quit", "Quit conductor"]),
     ];
 
     let widths = [Constraint::Length(18), Constraint::Min(20)];
@@ -93,5 +118,3 @@ pub fn render_keyboard_help(f: &mut Frame, area: Rect) {
 
     f.render_widget(table, inner);
 }
-
-use ratatui::layout::Constraint;

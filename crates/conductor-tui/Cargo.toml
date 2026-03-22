@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 conductor-types.workspace = true
+conductor-core.workspace = true
 tokio.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
