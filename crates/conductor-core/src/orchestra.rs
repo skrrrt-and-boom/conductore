@@ -39,8 +39,6 @@ use crate::CoreError;
 const MAX_REVIEW_RETRIES: u32 = 3;
 /// Maximum phase retries before forcing continue.
 const MAX_PHASE_RETRIES: u32 = 3;
-/// Task execution timeout (30 minutes).
-const TASK_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 /// Musician stuck timeout (35 minutes).
 const MUSICIAN_TIMEOUT_MS: u64 = 35 * 60 * 1000;
 /// Default verification timeout (2 minutes).
@@ -172,7 +170,6 @@ pub struct Orchestra {
 
     // Guidance
     guidance_queue: Vec<GuidanceMessage>,
-    musician_guidance_queue: HashMap<String, Vec<GuidanceMessage>>,
 
     // Plan validation & refinement
     plan_validation: Option<PlanValidation>,
@@ -263,7 +260,6 @@ impl Orchestra {
             last_memory_sync_offset: 0,
             verification_timeout_ms,
             guidance_queue: Vec::new(),
-            musician_guidance_queue: HashMap::new(),
             plan_validation: None,
             refinement_history: Vec::new(),
             phase_before_pause: OrchestraPhase::Init,
@@ -390,8 +386,8 @@ impl Orchestra {
                     self.broadcast_state();
                 }
                 _ = tick.tick() => {
-                    // Update elapsed time and check for stuck musicians
-                    self.tick();
+                    // Update elapsed time, check for stuck musicians, sync memory, process guidance
+                    self.tick().await;
                     self.broadcast_state();
                 }
             }
@@ -507,8 +503,9 @@ impl Orchestra {
         }
     }
 
-    /// Periodic tick — update elapsed time, check for stuck musicians.
-    fn tick(&mut self) {
+    /// Periodic tick — update elapsed time, check for stuck musicians,
+    /// sync memory, and process queued guidance.
+    async fn tick(&mut self) {
         let now = std::time::Instant::now();
         let mut stuck_ids = Vec::new();
         for (id, start) in &self.active_start_times {
@@ -522,6 +519,19 @@ impl Orchestra {
                 tracing::warn!(musician = %id, "force-cleaned stuck musician");
             }
             self.active_start_times.remove(&id);
+        }
+
+        // Sync shared memory to running musicians
+        self.sync_memory_to_active_musicians().await;
+
+        // Process queued user guidance
+        if !self.guidance_queue.is_empty() {
+            match self.process_guidance().await {
+                Ok(actions) => self.apply_guidance_actions(actions).await,
+                Err(e) => {
+                    tracing::warn!(error = %e, "guidance processing failed (non-fatal)");
+                }
+            }
         }
     }
 
@@ -1101,8 +1111,10 @@ impl Orchestra {
         Ok(())
     }
 
-    /// Sync task results from musician completion events.
+    /// Sync task results from musician completion events and run verification.
     async fn sync_task_results(&mut self) {
+        let mut newly_completed: Vec<(usize, String)> = Vec::new();
+
         for ms in &self.musician_states {
             if ms.status == MusicianStatus::Completed || ms.status == MusicianStatus::Failed {
                 if let Some(ref task) = ms.current_task {
@@ -1113,11 +1125,36 @@ impl Orchestra {
                             } else {
                                 TaskStatus::Failed
                             };
+                            // Track newly completed tasks for verification
+                            if t.status == TaskStatus::Completed {
+                                if let Some(snap) = self
+                                    .worktree_snapshots
+                                    .iter()
+                                    .find(|s| s.task_index == t.index)
+                                {
+                                    newly_completed
+                                        .push((t.index, snap.path.clone()));
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+
+        // Run verification on newly completed tasks
+        for (task_index, worktree_path) in newly_completed {
+            let (diff, verification_output, passed) =
+                self.run_verification(&worktree_path).await;
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.index == task_index) {
+                if let Some(ref mut result) = t.result {
+                    result.diff = Some(diff);
+                    result.verification_output = Some(verification_output);
+                    result.verification_passed = Some(passed);
+                }
+            }
+        }
+
         let _ = self.task_store.save_tasks(&self.tasks).await;
         let _ = self.persist_state().await;
     }
@@ -1626,12 +1663,6 @@ impl Orchestra {
 
     // ─── Task Scheduling ───────────────────────────────────────
 
-    fn active_tasks(&self) -> &[Task] {
-        // When executing within a phase, only consider that phase's tasks
-        // Otherwise, all tasks
-        &self.tasks
-    }
-
     fn has_remaining_tasks(&self) -> bool {
         let tasks = if let Some(ref indices) = self.current_phase_tasks {
             self.tasks
@@ -1761,21 +1792,23 @@ impl Orchestra {
         });
         let is_custom = self.config.verification.is_some();
 
+        let timeout = tokio::time::Duration::from_millis(self.verification_timeout_ms);
+
         for cmd in &commands {
-            match Command::new("sh")
+            let cmd_future = Command::new("sh")
                 .args(["-c", cmd])
                 .current_dir(worktree_path)
-                .output()
-                .await
-            {
-                Ok(output) if output.status.success() => {
+                .output();
+
+            match tokio::time::timeout(timeout, cmd_future).await {
+                Ok(Ok(output)) if output.status.success() => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     verification_outputs.push(format!("✓ {cmd}\n{stdout}"));
                     if !is_custom {
                         break;
                     }
                 }
-                Ok(output) => {
+                Ok(Ok(output)) => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     verification_outputs.push(format!("✗ {cmd}\n{stdout}{stderr}"));
@@ -1784,8 +1817,18 @@ impl Orchestra {
                         break;
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     verification_outputs.push(format!("✗ {cmd}\nError: {e}"));
+                    all_passed = false;
+                    if !is_custom {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    verification_outputs.push(format!(
+                        "✗ {cmd}\nError: timed out after {}ms",
+                        self.verification_timeout_ms
+                    ));
                     all_passed = false;
                     if !is_custom {
                         break;
