@@ -137,7 +137,7 @@ pub struct Orchestra {
     plan: Option<Plan>,
     tasks: Vec<Task>,
     phases: Vec<Phase>,
-    current_phase_index: i32,
+    current_phase_index: Option<usize>,
     musicians: Vec<Option<Musician>>,
     musician_states: Vec<MusicianState>,
 
@@ -178,6 +178,9 @@ pub struct Orchestra {
     // Active musician tracking
     active_musicians: HashMap<String, tokio::task::JoinHandle<()>>,
     active_start_times: HashMap<String, std::time::Instant>,
+
+    // Guidance channels — senders for injecting prompts into spawned musicians
+    guidance_channels: HashMap<String, mpsc::Sender<String>>,
 
     // Musician return channel (spawned tasks send musicians back after execution)
     musician_return_tx: mpsc::Sender<(usize, Musician)>,
@@ -240,7 +243,7 @@ impl Orchestra {
             plan: None,
             tasks: Vec::new(),
             phases: Vec::new(),
-            current_phase_index: -1,
+            current_phase_index: None,
             musicians: Vec::new(),
             musician_states: Vec::new(),
             analyst_states: Vec::new(),
@@ -265,6 +268,7 @@ impl Orchestra {
             phase_before_pause: OrchestraPhase::Init,
             active_musicians: HashMap::new(),
             active_start_times: HashMap::new(),
+            guidance_channels: HashMap::new(),
             musician_return_tx,
             musician_return_rx: Some(musician_return_rx),
             current_phase_tasks: None,
@@ -317,8 +321,10 @@ impl Orchestra {
     }
 
     /// Take the conductor out for use in a spawned task.
-    fn take_conductor(&mut self) -> ConductorAgent {
-        self.conductor.take().expect("conductor already taken")
+    fn take_conductor(&mut self) -> Result<ConductorAgent, CoreError> {
+        self.conductor
+            .take()
+            .ok_or_else(|| CoreError::Channel("conductor already taken".into()))
     }
 
     /// Return the conductor after a spawned task completes.
@@ -329,23 +335,35 @@ impl Orchestra {
     /// Run a conductor operation concurrently with event processing.
     ///
     /// Takes the conductor out, spawns `op` on a tokio task, and runs a
-    /// mini event loop that processes orchestra events (including ConductorOutput)
-    /// and broadcasts state updates to the TUI in real-time.
+    /// mini event loop that processes orchestra events (including ConductorOutput),
+    /// user actions (guidance), and broadcasts state updates to the TUI in real-time.
     async fn run_conductor_op<F, T>(&mut self, op: F) -> Result<T, CoreError>
     where
         F: FnOnce(ConductorAgent) -> Pin<Box<dyn Future<Output = (ConductorAgent, Result<T, CoreError>)> + Send>> + Send + 'static,
         T: Send + 'static,
     {
-        let conductor = self.take_conductor();
+        let mut conductor = self.take_conductor()?;
         let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+
+        // Create a guidance channel — the conductor's send_and_collect will
+        // select on this to inject user messages into the Claude session mid-turn.
+        let (conductor_guidance_tx, conductor_guidance_rx) = mpsc::channel::<String>(16);
+        conductor.set_guidance_rx(conductor_guidance_rx);
 
         tokio::spawn(async move {
             let result = op(conductor).await;
             let _ = result_tx.send(result);
         });
 
-        // Take event_rx to drain events while conductor runs
-        let mut event_rx = self.event_rx.take().expect("event_rx already taken");
+        // Take channels to process events and actions while conductor runs
+        let mut event_rx = self
+            .event_rx
+            .take()
+            .ok_or_else(|| CoreError::Channel("event_rx already taken".into()))?;
+        let mut action_rx = self
+            .action_rx
+            .take()
+            .ok_or_else(|| CoreError::Channel("action_rx already taken".into()))?;
 
         loop {
             tokio::select! {
@@ -359,11 +377,25 @@ impl Orchestra {
                         self.handle_event(event).await;
                     }
                     self.event_rx = Some(event_rx);
+                    self.action_rx = Some(action_rx);
                     self.broadcast_state();
                     return op_result;
                 }
                 Some(event) = event_rx.recv() => {
                     self.handle_event(event).await;
+                    self.broadcast_state();
+                }
+                Some(action) = action_rx.recv() => {
+                    // Process guidance: queue it and forward to conductor + musicians
+                    if let UserAction::SubmitGuidance { ref text, .. } = action {
+                        self.queue_guidance(text).await;
+                        let _ = conductor_guidance_tx.try_send(text.clone());
+                        for tx in self.guidance_channels.values() {
+                            let _ = tx.try_send(text.clone());
+                        }
+                    } else {
+                        self.handle_execution_action(action).await;
+                    }
                     self.broadcast_state();
                 }
             }
@@ -405,8 +437,14 @@ impl Orchestra {
     /// This should be called from the binary entry point after `run()` returns.
     /// It processes user actions (approve, refine, quit) and musician events.
     pub async fn event_loop(&mut self) -> Result<(), CoreError> {
-        let mut event_rx = self.event_rx.take().expect("event_rx already taken");
-        let mut action_rx = self.action_rx.take().expect("action_rx already taken");
+        let mut event_rx = self
+            .event_rx
+            .take()
+            .ok_or_else(|| CoreError::Channel("event_rx already taken".into()))?;
+        let mut action_rx = self
+            .action_rx
+            .take()
+            .ok_or_else(|| CoreError::Channel("action_rx already taken".into()))?;
         let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
 
         loop {
@@ -416,12 +454,18 @@ impl Orchestra {
                     self.broadcast_state();
                 }
                 Some(action) = action_rx.recv() => {
-                    // Temporarily return event_rx so execute_loop can drain musician events.
-                    // Safe: select! drops the event_rx.recv() future, releasing the borrow.
+                    // Temporarily return channels so execution methods can use them.
+                    // Safe: select! drops the recv() futures, releasing the borrows.
                     self.event_rx = Some(event_rx);
+                    self.action_rx = Some(action_rx);
                     self.handle_action(action).await;
                     self.broadcast_state();
-                    event_rx = self.event_rx.take().expect("event_rx not returned after handle_action");
+                    event_rx = self.event_rx.take().ok_or_else(|| {
+                        CoreError::Channel("event_rx not returned after handle_action".into())
+                    })?;
+                    action_rx = self.action_rx.take().ok_or_else(|| {
+                        CoreError::Channel("action_rx not returned after handle_action".into())
+                    })?;
                 }
                 _ = tick.tick() => {
                     // Update elapsed time, check for stuck musicians, sync memory, process guidance
@@ -485,6 +529,7 @@ impl Orchestra {
             } => {
                 self.active_musicians.remove(&musician_id);
                 self.active_start_times.remove(&musician_id);
+                self.guidance_channels.remove(&musician_id);
 
                 // Store result in the matching task
                 if let Some(ms) = self.musician_states.iter().find(|m| m.id == musician_id) {
@@ -543,15 +588,11 @@ impl Orchestra {
                     }
                 }
             }
-            UserAction::SubmitGuidance { text, images } => {
+            UserAction::SubmitGuidance { text, images: _ } => {
                 self.queue_guidance(&text).await;
-                // If images were attached to guidance, inject them to interactive musicians
-                if let Some(ref imgs) = images {
-                    for musician in self.musicians.iter_mut().filter_map(|m| m.as_mut()) {
-                        if musician.is_interactive() {
-                            let _ = musician.inject_prompt_with_images(&text, Some(imgs)).await;
-                        }
-                    }
+                // Send to all running musicians via guidance channels
+                for tx in self.guidance_channels.values() {
+                    let _ = tx.try_send(text.clone());
                 }
             }
             _ => {
@@ -845,9 +886,10 @@ impl Orchestra {
 
             let etx = event_tx.clone();
             let project_path = self.config.project_path.clone();
+            let (_gtx, guidance_rx) = mpsc::channel::<String>(1);
             let handle = tokio::spawn(async move {
                 analyst
-                    .execute(task, &project_path, "main", &project_path, etx, true, None)
+                    .execute(task, &project_path, "main", &project_path, etx, true, None, guidance_rx)
                     .await
             });
             handles.push(handle);
@@ -1002,195 +1044,90 @@ impl Orchestra {
     }
 
     /// Core execution loop — assigns tasks to idle musicians and waits for completion.
+    ///
+    /// Uses `select!` to process musician events, user actions, and periodic ticks
+    /// concurrently so that user guidance reaches running musicians in real time.
     async fn execute_loop(&mut self) -> Result<(), CoreError> {
-        while self.phase == OrchestraPhase::Executing
-            || self.phase == OrchestraPhase::PhaseExecuting
-        {
-            self.update_task_readiness();
+        let mut event_rx = self
+            .event_rx
+            .take()
+            .ok_or_else(|| CoreError::Channel("event_rx already taken".into()))?;
+        let mut action_rx = self
+            .action_rx
+            .take()
+            .ok_or_else(|| CoreError::Channel("action_rx already taken".into()))?;
+        let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
+        let mut needs_assignment = true;
 
-            if !self.has_remaining_tasks() {
+        loop {
+            // Phase check
+            if self.phase != OrchestraPhase::Executing
+                && self.phase != OrchestraPhase::PhaseExecuting
+            {
                 break;
             }
 
-            // Find idle musicians and assign tasks
-            let idle_indices: Vec<usize> = self.musician_states.iter().enumerate()
-                .filter(|(idx, ms)| {
-                    (ms.status == MusicianStatus::Idle || ms.status == MusicianStatus::Completed)
-                        && self.musicians.get(*idx).map(|m| m.is_some()).unwrap_or(false)
-                })
-                .map(|(idx, _)| idx)
-                .collect();
-            let mut assignments: Vec<(usize, Task)> = Vec::new();
-            for idx in idle_indices {
-                if let Some(task) = self.get_next_ready_task() {
-                    assignments.push((idx, task));
+            // Assign tasks to idle musicians when needed
+            if needs_assignment {
+                self.update_task_readiness();
+
+                if !self.has_remaining_tasks() && self.active_musicians.is_empty() {
+                    break;
                 }
+
+                self.try_assign_tasks().await;
+                needs_assignment = false;
             }
 
-            if assignments.is_empty() {
-                if self.active_musicians.is_empty() {
-                    self.set_phase(OrchestraPhase::Failed);
-                    return Err(CoreError::Channel(
-                        "All remaining tasks are blocked".into(),
-                    ));
-                }
-                // Wait for a musician to finish
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                // Process any pending events
-                {
-                    let events: Vec<_> = self.event_rx.as_mut()
-                        .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
-                        .unwrap_or_default();
-                    for event in events {
-                        self.handle_event(event).await;
-                    }
-                }
-                continue;
+            // If nothing is running and no tasks remain, we're done
+            if self.active_musicians.is_empty() && !self.has_remaining_tasks() {
+                break;
             }
 
-            let use_worktrees = self.worktree_manager.is_git_repo().await;
-
-            for (idx, mut task) in assignments {
-                task.status = TaskStatus::InProgress;
-                task.assigned_musician = Some(self.musicians[idx].as_ref().unwrap().get_state().id.clone());
-
-                // Update task in our list
-                if let Some(t) = self.tasks.iter_mut().find(|t| t.index == task.index) {
-                    t.status = TaskStatus::InProgress;
-                    t.assigned_musician = task.assigned_musician.clone();
-                }
-
-                let slug = task
-                    .title
-                    .to_lowercase()
-                    .chars()
-                    .map(|c| if c.is_alphanumeric() { c } else { '-' })
-                    .collect::<String>();
-                let slug = &slug[..slug.len().min(30)];
-
-                let (worktree_path, branch) = if use_worktrees {
-                    let musician_id = self.musicians[idx].as_ref().unwrap().get_state().id.clone();
-                    match self.worktree_manager.create(&musician_id, slug).await {
-                        Ok((path, branch)) => (path.to_string_lossy().to_string(), branch),
-                        Err(e) => {
-                            tracing::error!(error = %e, "failed to create worktree");
-                            (self.config.project_path.clone(), "main".into())
-                        }
-                    }
-                } else {
-                    (self.config.project_path.clone(), "main".into())
-                };
-
-                // Smart model routing
-                if let Some(ref model) = task.model {
-                    self.musicians[idx].as_mut().unwrap().set_model_override(model);
-                }
-
-                // Track worktree snapshot
-                if use_worktrees {
-                    self.worktree_snapshots.push(WorktreeSnapshot {
-                        worker_id: self.musicians[idx].as_ref().unwrap().get_state().id.clone(),
-                        task_index: task.index,
-                        branch: branch.clone(),
-                        path: worktree_path.clone(),
-                        last_commit_sha: String::new(),
-                        status: WorktreeStatus::Active,
-                    });
-                }
-
-                // Read shared memory for the musician
-                let shared_mem = self.memory.read().await.ok().filter(|s| !s.is_empty());
-
-                // Generate assignment insight
-                self.insight_generator
-                    .on_task_assigned(&self.musicians[idx].as_ref().unwrap().get_state().id, &task);
-
-                let event_tx = self.event_tx.clone();
-                let project_path = self.config.project_path.clone();
-                let musician_id = self.musicians[idx].as_ref().unwrap().get_state().id.clone();
-                let task_clone = task.clone();
-                let wt_path = worktree_path.clone();
-                let br = branch.clone();
-
-                // Take the musician out of the Vec for the spawned task.
-                // It will be returned via musician_return_tx after execution.
-                let mut musician = self.musicians[idx].take()
-                    .expect("musician should be present when assigned");
-                let return_tx = self.musician_return_tx.clone();
-
-                let handle = tokio::spawn(async move {
-                    let result = musician
-                        .execute(
-                            task_clone,
-                            &wt_path,
-                            &br,
-                            &project_path,
-                            event_tx,
-                            false,
-                            shared_mem,
-                        )
-                        .await;
-                    // Result is already sent via MusicianComplete event in execute()
-                    let _ = result;
-                    // Return musician to orchestra
-                    let _ = return_tx.send((idx, musician)).await;
-                });
-
-                self.active_musicians.insert(musician_id.clone(), handle);
-                self.active_start_times
-                    .insert(musician_id, std::time::Instant::now());
+            // If nothing is running but tasks are blocked, fail
+            if self.active_musicians.is_empty() {
+                self.set_phase(OrchestraPhase::Failed);
+                self.event_rx = Some(event_rx);
+                self.action_rx = Some(action_rx);
+                return Err(CoreError::Channel(
+                    "All remaining tasks are blocked".into(),
+                ));
             }
 
-            // Process events while waiting
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            {
-                let events: Vec<_> = self.event_rx.as_mut()
-                    .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
-                    .unwrap_or_default();
-                for event in events {
+            // Wait for events, user actions, or tick
+            tokio::select! {
+                Some(event) = event_rx.recv() => {
                     self.handle_event(event).await;
+                    self.broadcast_state();
                 }
-            }
-            self.drain_musician_returns();
-            self.broadcast_state();
-
-            // Wait for at least one musician to finish
-            if !self.active_musicians.is_empty() {
-                // Poll until one completes
-                loop {
+                Some(action) = action_rx.recv() => {
+                    self.handle_execution_action(action).await;
+                    self.broadcast_state();
+                }
+                _ = tick.tick() => {
+                    self.tick().await;
+                    // Check for completed musicians
                     let mut completed = Vec::new();
                     for (id, handle) in &self.active_musicians {
                         if handle.is_finished() {
                             completed.push(id.clone());
                         }
                     }
-                    if !completed.is_empty() {
-                        for id in completed {
-                            if let Some(handle) = self.active_musicians.remove(&id) {
-                                if let Err(e) = handle.await {
-                                    tracing::error!(musician = %id, error = %e, "musician task panicked");
-                                }
+                    for id in completed {
+                        if let Some(handle) = self.active_musicians.remove(&id) {
+                            if let Err(e) = handle.await {
+                                tracing::error!(musician = %id, error = %e, "musician task panicked");
                             }
                         }
-                        break;
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    // Drain events
-                    {
-                        let events: Vec<_> = self.event_rx.as_mut()
-                            .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
-                            .unwrap_or_default();
-                        for event in events {
-                            self.handle_event(event).await;
-                        }
+                        self.guidance_channels.remove(&id);
+                        self.active_start_times.remove(&id);
                     }
                     self.drain_musician_returns();
+                    self.sync_task_results().await;
+                    needs_assignment = true;
                     self.broadcast_state();
                 }
             }
-
-            // Post-completion: update task statuses from musician states
-            self.sync_task_results().await;
         }
 
         // Wait for all remaining musicians
@@ -1201,25 +1138,167 @@ impl Orchestra {
             }
         }
         self.active_start_times.clear();
+        self.guidance_channels.clear();
 
         // Drain final events and returned musicians
-        {
-            let events: Vec<_> = self.event_rx.as_mut()
-                .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
-                .unwrap_or_default();
-            for event in events {
-                self.handle_event(event).await;
-            }
+        while let Ok(event) = event_rx.try_recv() {
+            self.handle_event(event).await;
         }
         self.drain_musician_returns();
         self.sync_task_results().await;
 
+        // Return channels
+        self.event_rx = Some(event_rx);
+        self.action_rx = Some(action_rx);
+
         Ok(())
+    }
+
+    /// Handle user actions during execution (guidance, quit).
+    async fn handle_execution_action(&mut self, action: UserAction) {
+        match action {
+            UserAction::SubmitGuidance { text, images: _ } => {
+                self.queue_guidance(&text).await;
+                // Send directly to all running musicians via guidance channels
+                for tx in self.guidance_channels.values() {
+                    let _ = tx.try_send(text.clone());
+                }
+            }
+            UserAction::Quit => {
+                self.shutdown().await;
+                self.set_phase(OrchestraPhase::Complete);
+            }
+            _ => {
+                // Ignore ApprovePlan, RefinePlan, SubmitTask during execution
+            }
+        }
+    }
+
+    /// Try to assign ready tasks to idle musicians.
+    async fn try_assign_tasks(&mut self) {
+        // Find idle musicians and assign tasks
+        let idle_indices: Vec<usize> = self.musician_states.iter().enumerate()
+            .filter(|(idx, ms)| {
+                (ms.status == MusicianStatus::Idle || ms.status == MusicianStatus::Completed)
+                    && self.musicians.get(*idx).map(|m| m.is_some()).unwrap_or(false)
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        let mut assignments: Vec<(usize, Task)> = Vec::new();
+        for idx in idle_indices {
+            if let Some(task) = self.get_next_ready_task() {
+                assignments.push((idx, task));
+            }
+        }
+
+        if assignments.is_empty() {
+            return;
+        }
+
+        let use_worktrees = self.worktree_manager.is_git_repo().await;
+
+        for (idx, mut task) in assignments {
+            task.status = TaskStatus::InProgress;
+            task.assigned_musician = Some(self.musicians[idx].as_ref().unwrap().get_state().id.clone());
+
+            // Update task in our list
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.index == task.index) {
+                t.status = TaskStatus::InProgress;
+                t.assigned_musician = task.assigned_musician.clone();
+            }
+
+            let slug = task
+                .title
+                .to_lowercase()
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '-' })
+                .collect::<String>();
+            let slug = &slug[..slug.len().min(30)];
+
+            let (worktree_path, branch) = if use_worktrees {
+                let musician_id = self.musicians[idx].as_ref().unwrap().get_state().id.clone();
+                match self.worktree_manager.create(&musician_id, slug).await {
+                    Ok((path, branch)) => (path.to_string_lossy().to_string(), branch),
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to create worktree");
+                        (self.config.project_path.clone(), "main".into())
+                    }
+                }
+            } else {
+                (self.config.project_path.clone(), "main".into())
+            };
+
+            // Smart model routing
+            if let Some(ref model) = task.model {
+                self.musicians[idx].as_mut().unwrap().set_model_override(model);
+            }
+
+            // Track worktree snapshot
+            if use_worktrees {
+                self.worktree_snapshots.push(WorktreeSnapshot {
+                    worker_id: self.musicians[idx].as_ref().unwrap().get_state().id.clone(),
+                    task_index: task.index,
+                    branch: branch.clone(),
+                    path: worktree_path.clone(),
+                    last_commit_sha: String::new(),
+                    status: WorktreeStatus::Active,
+                });
+            }
+
+            // Read shared memory for the musician
+            let shared_mem = self.memory.read().await.ok().filter(|s| !s.is_empty());
+
+            // Generate assignment insight
+            self.insight_generator
+                .on_task_assigned(&self.musicians[idx].as_ref().unwrap().get_state().id, &task);
+
+            let event_tx = self.event_tx.clone();
+            let project_path = self.config.project_path.clone();
+            let musician_id = self.musicians[idx].as_ref().unwrap().get_state().id.clone();
+            let task_clone = task.clone();
+            let wt_path = worktree_path.clone();
+            let br = branch.clone();
+
+            // Create guidance channel for this musician
+            let (guidance_tx, guidance_rx) = mpsc::channel::<String>(16);
+            self.guidance_channels.insert(musician_id.clone(), guidance_tx);
+
+            // Take the musician out of the Vec for the spawned task.
+            // It will be returned via musician_return_tx after execution.
+            let mut musician = self.musicians[idx].take()
+                .expect("musician should be present when assigned");
+            let return_tx = self.musician_return_tx.clone();
+
+            let handle = tokio::spawn(async move {
+                let result = musician
+                    .execute(
+                        task_clone,
+                        &wt_path,
+                        &br,
+                        &project_path,
+                        event_tx,
+                        false,
+                        shared_mem,
+                        guidance_rx,
+                    )
+                    .await;
+                // Result is already sent via MusicianComplete event in execute()
+                let _ = result;
+                // Return musician to orchestra
+                let _ = return_tx.send((idx, musician)).await;
+            });
+
+            self.active_musicians.insert(musician_id.clone(), handle);
+            self.active_start_times
+                .insert(musician_id, std::time::Instant::now());
+        }
+
+        self.broadcast_state();
     }
 
     /// Sync task results from musician completion events and run verification.
     async fn sync_task_results(&mut self) {
-        let mut newly_completed: Vec<(usize, String)> = Vec::new();
+        let mut newly_completed: Vec<(usize, Option<String>)> = Vec::new();
 
         for ms in &self.musician_states {
             if ms.status == MusicianStatus::Completed || ms.status == MusicianStatus::Failed {
@@ -1239,7 +1318,10 @@ impl Orchestra {
                                     .find(|s| s.task_index == t.index)
                                 {
                                     newly_completed
-                                        .push((t.index, snap.path.clone()));
+                                        .push((t.index, Some(snap.path.clone())));
+                                } else {
+                                    // No worktree — still track for verification marking
+                                    newly_completed.push((t.index, None));
                                 }
                             }
                         }
@@ -1248,15 +1330,41 @@ impl Orchestra {
             }
         }
 
-        // Run verification on newly completed tasks
-        for (task_index, worktree_path) in newly_completed {
-            let (diff, verification_output, passed) =
-                self.run_verification(&worktree_path).await;
+        // Run verification on newly completed tasks — collect results first to avoid borrow conflicts
+        let mut verification_results: Vec<(usize, Option<(String, String, bool)>)> = Vec::new();
+        for (task_index, worktree_path) in &newly_completed {
+            if let Some(worktree) = worktree_path {
+                let (diff, verification_output, passed) =
+                    self.run_verification(worktree).await;
+                verification_results.push((*task_index, Some((diff, verification_output, passed))));
+            } else {
+                verification_results.push((*task_index, None));
+            }
+        }
+
+        // Apply verification results to tasks
+        for (task_index, result) in verification_results {
             if let Some(t) = self.tasks.iter_mut().find(|t| t.index == task_index) {
-                if let Some(ref mut result) = t.result {
-                    result.diff = Some(diff);
-                    result.verification_output = Some(verification_output);
-                    result.verification_passed = Some(passed);
+                match result {
+                    Some((diff, verification_output, passed)) => {
+                        if let Some(ref mut r) = t.result {
+                            r.diff = Some(diff);
+                            r.verification_output = Some(verification_output);
+                            r.verification_passed = Some(passed);
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            task_index,
+                            title = %t.title,
+                            "task completed without a worktree — verification skipped"
+                        );
+                        if let Some(ref mut r) = t.result {
+                            r.verification_output =
+                                Some("Skipped: no worktree available".into());
+                            r.verification_passed = None;
+                        }
+                    }
                 }
             }
         }
@@ -1277,7 +1385,7 @@ impl Orchestra {
                 return Ok(());
             }
 
-            self.current_phase_index = pi as i32;
+            self.current_phase_index = Some(pi);
             self.phases[pi].status = PhaseStatus::Active;
             self.broadcast_state();
 
@@ -1755,6 +1863,11 @@ impl Orchestra {
                 "[MEMORY UPDATE from other musicians]:\n{}",
                 &content[..content.len().min(2000)]
             );
+            // Send via guidance channels to spawned musicians
+            for tx in self.guidance_channels.values() {
+                let _ = tx.try_send(msg.clone());
+            }
+            // Also try local musicians (e.g., not yet spawned)
             for musician in self.musicians.iter_mut().filter_map(|m| m.as_mut()) {
                 if musician.is_interactive() {
                     let _ = musician.inject_prompt(&msg).await;
@@ -1959,11 +2072,7 @@ impl Orchestra {
             } else {
                 Some(self.phases.clone())
             },
-            current_phase_index: if self.phases.is_empty() {
-                None
-            } else {
-                Some(self.current_phase_index)
-            },
+            current_phase_index: self.current_phase_index,
             worktree_state: if self.worktree_snapshots.is_empty() {
                 None
             } else {
@@ -1998,6 +2107,11 @@ impl Orchestra {
 
     /// Send a message to a specific musician's active session.
     pub async fn chat_with_musician(&mut self, musician_id: &str, message: &str) -> bool {
+        // Try guidance channel first (for spawned musicians)
+        if let Some(tx) = self.guidance_channels.get(musician_id) {
+            return tx.try_send(message.to_string()).is_ok();
+        }
+        // Fall back to direct injection (for local musicians)
         if let Some(m) = self.musicians.iter_mut().filter_map(|m| m.as_mut()).find(|m| m.get_state().id == musician_id) {
             m.inject_prompt(message).await
         } else {
@@ -2007,12 +2121,14 @@ impl Orchestra {
 
     /// Get list of musician IDs that currently accept prompt injection.
     pub fn get_interactive_musicians(&self) -> Vec<String> {
-        self.musicians
-            .iter()
-            .filter_map(|m| m.as_ref())
-            .filter(|m| m.is_interactive())
-            .map(|m| m.get_state().id.clone())
-            .collect()
+        let mut ids: Vec<String> = self.guidance_channels.keys().cloned().collect();
+        // Also include local interactive musicians
+        for m in self.musicians.iter().filter_map(|m| m.as_ref()) {
+            if m.is_interactive() && !ids.contains(&m.get_state().id) {
+                ids.push(m.get_state().id.clone());
+            }
+        }
+        ids
     }
 }
 

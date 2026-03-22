@@ -61,6 +61,8 @@ pub struct ConductorAgent {
     pub prompts_sent: Vec<String>,
     /// Optional event channel for streaming output to orchestra.
     event_tx: Option<mpsc::Sender<OrchestraEvent>>,
+    /// Channel for receiving user guidance during operations.
+    guidance_rx: Option<mpsc::Receiver<String>>,
 }
 
 impl ConductorAgent {
@@ -72,6 +74,7 @@ impl ConductorAgent {
             event_rx: None,
             prompts_sent: Vec::new(),
             event_tx: None,
+            guidance_rx: None,
         }
     }
 
@@ -80,11 +83,29 @@ impl ConductorAgent {
         self.event_tx = Some(tx);
     }
 
+    /// Set the guidance channel for receiving user messages during operations.
+    pub fn set_guidance_rx(&mut self, rx: mpsc::Receiver<String>) {
+        self.guidance_rx = Some(rx);
+    }
+
     /// Returns whether the session is alive.
     pub fn has_session(&self) -> bool {
         self.session
             .as_ref()
             .is_some_and(|s| !s.is_closed())
+    }
+
+    /// Inject a user guidance message into the running conductor session.
+    pub async fn inject_message(&mut self, text: &str) -> Result<(), CoreError> {
+        if let Some(ref mut session) = self.session {
+            if !session.is_closed() {
+                session
+                    .send_message(text)
+                    .await
+                    .map_err(|e| CoreError::Channel(format!("conductor inject failed: {e}")))?;
+            }
+        }
+        Ok(())
     }
 
     // ─── V1: Single-pass planning ────────────────────────────────
@@ -425,7 +446,9 @@ impl ConductorAgent {
                 .map_err(|e| CoreError::Bridge(e.to_string()))?;
         }
 
-        // Collect events until a Result event signals turn completion
+        // Collect events until a Result event signals turn completion.
+        // We take guidance_rx out so we can borrow it alongside event_rx and session.
+        let mut guidance_rx = self.guidance_rx.take();
         let event_rx = self.event_rx.as_mut().unwrap();
         let event_tx = self.event_tx.clone();
         let mut full_output = String::new();
@@ -434,6 +457,14 @@ impl ConductorAgent {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
+            // Helper future for guidance — resolves to Some(msg) if guidance_rx is set
+            let guidance_fut = async {
+                match guidance_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+
             let event = tokio::select! {
                 ev = event_rx.recv() => {
                     match ev {
@@ -443,15 +474,28 @@ impl ConductorAgent {
                             if !full_output.is_empty() {
                                 break;
                             }
+                            self.guidance_rx = guidance_rx;
                             return Err(CoreError::Channel("Session closed before turn completed".into()));
                         }
                     }
+                }
+                Some(msg) = guidance_fut => {
+                    // Inject user guidance into the running session.
+                    // The message is queued and delivered when Claude finishes its current turn.
+                    if let Some(ref mut session) = self.session {
+                        if !session.is_closed() {
+                            let _ = session.send_message(&msg).await;
+                            Self::emit(&event_tx, &format!("[USER GUIDANCE] {msg}"));
+                        }
+                    }
+                    continue;
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     if !full_output.is_empty() {
                         tracing::warn!("send_and_collect timed out, returning partial output");
                         break;
                     }
+                    self.guidance_rx = guidance_rx;
                     return Err(CoreError::Timeout("send_and_collect timed out after 300s".into()));
                 }
             };
@@ -496,6 +540,9 @@ impl ConductorAgent {
                 _ => {}
             }
         }
+
+        // Restore guidance channel
+        self.guidance_rx = guidance_rx;
 
         Ok(full_output)
     }

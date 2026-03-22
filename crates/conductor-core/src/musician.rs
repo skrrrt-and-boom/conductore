@@ -230,6 +230,7 @@ impl Musician {
     /// * `event_tx` — channel to send events to the orchestra
     /// * `read_only` — if true, restrict tools and skip shared memory
     /// * `shared_memory_content` — optional shared memory to append to system prompt
+    /// * `guidance_rx` — channel for receiving user guidance during execution
     pub async fn execute(
         &mut self,
         task: Task,
@@ -239,6 +240,7 @@ impl Musician {
         event_tx: mpsc::Sender<OrchestraEvent>,
         read_only: bool,
         shared_memory_content: Option<String>,
+        mut guidance_rx: mpsc::Receiver<String>,
     ) -> TaskResult {
         // Reset state for this execution
         let now = chrono::Utc::now().to_rfc3339();
@@ -324,8 +326,29 @@ impl Musician {
 
         self.session = Some(session);
 
-        // Event processing loop
-        while let Some(event) = claude_rx.recv().await {
+        // Event processing loop — select on both Claude events and user guidance
+        loop {
+            let event = tokio::select! {
+                Some(event) = claude_rx.recv() => event,
+                Some(msg) = guidance_rx.recv() => {
+                    // Inject user guidance into the running session
+                    if let Some(ref mut session) = self.session {
+                        if !session.is_closed() {
+                            let _ = session.send_message(&msg).await;
+                            self.push_output(&format!("[USER] {msg}"));
+                            let _ = event_tx
+                                .send(OrchestraEvent::MusicianOutput {
+                                    musician_id: self.id.clone(),
+                                    line: format!("[USER] {msg}"),
+                                })
+                                .await;
+                        }
+                    }
+                    continue;
+                }
+                else => break,
+            };
+
             self.state.elapsed_ms = start.elapsed().as_millis() as u64;
 
             match event.event_type {

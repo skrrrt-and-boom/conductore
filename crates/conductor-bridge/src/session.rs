@@ -137,6 +137,7 @@ impl ClaudeSession {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             let mut consecutive_parse_failures: u32 = 0;
+            let mut session_id: Option<String> = None;
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
@@ -147,7 +148,7 @@ impl ClaudeSession {
                         match serde_json::from_str::<serde_json::Value>(&trimmed) {
                             Ok(raw) => {
                                 consecutive_parse_failures = 0;
-                                let events = crate::parse::parse_claude_event(&raw);
+                                let events = crate::parse::parse_claude_event(&raw, &mut session_id);
                                 for event in events {
                                     if event_tx.send(event).await.is_err() {
                                         // Receiver dropped — session is being torn down
