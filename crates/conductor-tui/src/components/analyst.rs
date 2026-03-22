@@ -107,12 +107,7 @@ fn render_analyst_column(
     let output = Paragraph::new(lines).scroll((scroll, 0));
     f.render_widget(output, output_area);
 
-    let tok = theme::format_tokens(analyst.tokens_used, analyst.tokens_estimated);
     let elapsed = theme::elapsed(analyst.elapsed_ms);
-    let stats = Line::from(vec![
-        Span::styled(tok, Style::default().fg(C_DIM)),
-        Span::styled("  ", Style::default()),
-        Span::styled(elapsed, Style::default().fg(C_DIM)),
-    ]);
+    let stats = Line::from(Span::styled(elapsed, Style::default().fg(C_DIM)));
     f.render_widget(Paragraph::new(stats), stats_area);
 }

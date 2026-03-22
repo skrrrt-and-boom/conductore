@@ -11,13 +11,12 @@ use std::collections::HashSet;
 use conductor_bridge::{ClaudeSession, ClaudeSessionOptions};
 use conductor_types::{
     Checkpoint, ClaudeEvent, ClaudeEventType, MusicianState, MusicianStatus, OrchestraEvent, Task,
-    TaskResult, TokenUsage,
+    TaskResult,
 };
 use tokio::sync::mpsc;
 
 use crate::conductor_agent::load_project_instructions;
 use crate::rate_limiter::is_rate_limit_message;
-use crate::token_estimate::{calibrate_token_estimate, estimate_tokens};
 use crate::tool_summary::summarize_tool_use;
 
 /// Maximum number of output lines kept per musician.
@@ -111,16 +110,12 @@ impl Musician {
             status: MusicianStatus::Idle,
             current_task: None,
             output_lines: Vec::new(),
-            tokens_used: 0,
-            token_usage: TokenUsage::default(),
-            tokens_estimated: false,
             started_at: None,
             elapsed_ms: 0,
             worktree_path: None,
             branch: None,
             checkpoint: None,
             prompt_sent: None,
-            cost_usd: 0.0,
         };
         Self {
             id,
@@ -253,22 +248,17 @@ impl Musician {
             status: MusicianStatus::Running,
             current_task: Some(task.clone()),
             output_lines: Vec::new(),
-            tokens_used: 0,
-            token_usage: TokenUsage::default(),
-            tokens_estimated: true,
             started_at: Some(now),
             elapsed_ms: 0,
             worktree_path: Some(worktree_path.to_string()),
             branch: Some(branch.to_string()),
             checkpoint: None,
             prompt_sent: None,
-            cost_usd: 0.0,
         };
         self.send_status_change(&event_tx).await;
 
         let start = std::time::Instant::now();
         let mut last_message = String::new();
-        let mut total_tokens: u64 = 0;
         let mut turn_count: u32 = 0;
         let mut files_modified: HashSet<String> = HashSet::new();
         let mut received_result = false;
@@ -325,7 +315,6 @@ impl Musician {
                 files_modified: Vec::new(),
                 summary: "Failed to start Claude session".into(),
                 error: Some(e.to_string()),
-                tokens_used: 0,
                 duration_ms: start.elapsed().as_millis() as u64,
                 diff: None,
                 verification_output: None,
@@ -350,10 +339,6 @@ impl Musician {
                                 line: message.clone(),
                             })
                             .await;
-                        // Estimate output tokens
-                        self.state.token_usage.output += estimate_tokens(message);
-                        self.state.tokens_used =
-                            self.state.token_usage.input + self.state.token_usage.output;
                     }
                 }
 
@@ -370,13 +355,6 @@ impl Musician {
                                 tool_input: event.tool_input.clone(),
                             })
                             .await;
-
-                        // Estimate output tokens from serialized tool input
-                        if let Some(ref input) = event.tool_input {
-                            if let Ok(serialized) = serde_json::to_string(input) {
-                                self.state.token_usage.output += estimate_tokens(&serialized);
-                            }
-                        }
 
                         // Track file modifications (Write/Edit tools)
                         if tool_name == "Write" || tool_name == "Edit" {
@@ -402,44 +380,16 @@ impl Musician {
                                 turn_number: turn_count,
                                 files_modified: files_modified.iter().cloned().collect(),
                                 timestamp: chrono::Utc::now().to_rfc3339(),
-                                token_used: self.state.tokens_used,
                                 commit_sha: None,
                             });
                         }
                     }
                 }
 
-                ClaudeEventType::ToolResult => {
-                    // Estimate input tokens from tool result content
-                    if let Some(ref content) = event.tool_result_content {
-                        self.state.token_usage.input += estimate_tokens(content);
-                        self.state.tokens_used =
-                            self.state.token_usage.input + self.state.token_usage.output;
-                    }
-                }
+                ClaudeEventType::ToolResult => {}
 
                 ClaudeEventType::Result => {
                     received_result = true;
-
-                    // Track cost
-                    if let Some(cost) = event.cost_usd {
-                        self.state.cost_usd += cost;
-                    }
-
-                    // Calibrate token estimates with actuals
-                    if let Some(ref usage) = event.usage {
-                        let estimated_total =
-                            self.state.token_usage.input + self.state.token_usage.output;
-                        let actual_total = usage.input + usage.output;
-                        if estimated_total > 0 && actual_total > 0 {
-                            calibrate_token_estimate(estimated_total * 4, actual_total);
-                        }
-                        // Replace estimates with actuals
-                        self.state.token_usage = usage.clone();
-                        total_tokens = usage.input + usage.output;
-                        self.state.tokens_used = total_tokens;
-                        self.state.tokens_estimated = false;
-                    }
 
                     if event.is_error == Some(true) {
                         result_was_error = true;
@@ -480,7 +430,6 @@ impl Musician {
                             files_modified: files_modified.into_iter().collect(),
                             summary: "Rate limited — paused for resume".into(),
                             error: Some("rate_limited".into()),
-                            tokens_used: total_tokens,
                             duration_ms: start.elapsed().as_millis() as u64,
                             diff: None,
                             verification_output: None,
@@ -529,7 +478,6 @@ impl Musician {
             } else {
                 Some("Session closed without successful result".into())
             },
-            tokens_used: total_tokens,
             duration_ms: start.elapsed().as_millis() as u64,
             diff: None,
             verification_output: None,

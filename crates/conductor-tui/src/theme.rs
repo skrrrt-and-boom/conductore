@@ -117,23 +117,6 @@ pub fn elapsed(ms: u64) -> String {
     }
 }
 
-/// Format a token count, optionally prefixed with '~' for estimates.
-/// Examples: "500", "5K", "~89K", "1.2M"
-pub fn format_tokens(n: u64, estimated: bool) -> String {
-    let formatted = if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{}K", (n + 500) / 1000)
-    } else {
-        format!("{}", n)
-    };
-    if estimated {
-        format!("~{}", formatted)
-    } else {
-        formatted
-    }
-}
-
 /// Truncate a string to `max` chars, appending '…' if truncated.
 pub fn trunc(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -232,33 +215,6 @@ mod tests {
     fn elapsed_hours() {
         // 3661000ms = 3661s = 61m01s = 1h1m
         assert_eq!(elapsed(3661000), "1h1m");
-    }
-
-    // format_tokens()
-
-    #[test]
-    fn format_tokens_small() {
-        assert_eq!(format_tokens(500, false), "500");
-    }
-
-    #[test]
-    fn format_tokens_kilo() {
-        assert_eq!(format_tokens(5000, false), "5K");
-    }
-
-    #[test]
-    fn format_tokens_mega() {
-        assert_eq!(format_tokens(1_500_000, false), "1.5M");
-    }
-
-    #[test]
-    fn format_tokens_estimated() {
-        assert_eq!(format_tokens(89_000, true), "~89K");
-    }
-
-    #[test]
-    fn format_tokens_estimated_small() {
-        assert_eq!(format_tokens(500, true), "~500");
     }
 
     // trunc()

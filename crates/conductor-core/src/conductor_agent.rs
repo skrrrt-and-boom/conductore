@@ -11,13 +11,12 @@ use std::path::Path;
 use conductor_bridge::{ClaudeSession, ClaudeSessionOptions};
 use conductor_types::{
     AnalysisDirective, AnalysisResult, ClaudeEvent, ClaudeEventType, CodebaseMap, GuidanceActions,
-    GuidanceInput, Phase, PhaseReviewAction, PhaseReviewResult, Plan, PlanInsight, Task,
-    TaskStatus, TokenUsage,
+    GuidanceInput, OrchestraEvent, Phase, PhaseReviewAction, PhaseReviewResult, Plan, PlanInsight,
+    Task, TaskStatus,
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::token_estimate::estimate_tokens;
 use crate::tool_summary::summarize_tool_use;
 use crate::CoreError;
 
@@ -29,7 +28,6 @@ pub struct DecomposeResult {
     pub summary: String,
     pub learning_notes: Vec<String>,
     pub insights: Option<Vec<PlanInsight>>,
-    pub estimated_tokens: u64,
     pub estimated_minutes: u32,
 }
 
@@ -52,23 +50,6 @@ pub struct ReviewInput {
     pub verification_results: Option<HashMap<usize, String>>,
 }
 
-/// Callbacks the orchestra provides so the conductor can stream output.
-pub struct ConductorCallbacks {
-    pub on_output: Option<Box<dyn Fn(&str) + Send>>,
-    pub on_tokens: Option<Box<dyn Fn(&TokenUsage) + Send>>,
-    pub on_estimated_change: Option<Box<dyn Fn(bool) + Send>>,
-}
-
-impl Default for ConductorCallbacks {
-    fn default() -> Self {
-        Self {
-            on_output: None,
-            on_tokens: None,
-            on_estimated_change: None,
-        }
-    }
-}
-
 // ─── ConductorAgent ─────────────────────────────────────────────
 
 pub struct ConductorAgent {
@@ -78,8 +59,8 @@ pub struct ConductorAgent {
     event_rx: Option<mpsc::Receiver<ClaudeEvent>>,
     /// All prompts sent to the conductor, in order.
     pub prompts_sent: Vec<String>,
-    /// Accumulated cost from all result events (USD).
-    pub total_cost_usd: f64,
+    /// Optional event channel for streaming output to orchestra.
+    event_tx: Option<mpsc::Sender<OrchestraEvent>>,
 }
 
 impl ConductorAgent {
@@ -90,8 +71,13 @@ impl ConductorAgent {
             session: None,
             event_rx: None,
             prompts_sent: Vec::new(),
-            total_cost_usd: 0.0,
+            event_tx: None,
         }
+    }
+
+    /// Set the event channel for streaming output to orchestra.
+    pub fn set_event_tx(&mut self, tx: mpsc::Sender<OrchestraEvent>) {
+        self.event_tx = Some(tx);
     }
 
     /// Returns whether the session is alive.
@@ -108,7 +94,6 @@ impl ConductorAgent {
         &mut self,
         project_path: &str,
         task_description: &str,
-        callbacks: &ConductorCallbacks,
         reference_session_context: Option<&str>,
     ) -> Result<Plan, CoreError> {
         let prompt = plan_prompt(project_path, task_description, reference_session_context);
@@ -127,7 +112,7 @@ impl ConductorAgent {
             cwd: Some(self.cwd.clone()),
         });
 
-        let output = self.send_and_collect(&prompt, callbacks).await?;
+        let output = self.send_and_collect(&prompt).await?;
         parse_plan_from_output(&output)
     }
 
@@ -138,7 +123,6 @@ impl ConductorAgent {
         &mut self,
         project_path: &str,
         task_description: &str,
-        callbacks: &ConductorCallbacks,
         reference_session_context: Option<&str>,
     ) -> Result<CodebaseMap, CoreError> {
         let prompt = explore_prompt(project_path, task_description, reference_session_context);
@@ -157,7 +141,7 @@ impl ConductorAgent {
             cwd: Some(self.cwd.clone()),
         });
 
-        let output = self.send_and_collect(&prompt, callbacks).await?;
+        let output = self.send_and_collect(&prompt).await?;
         let parsed: CodebaseMap = parse_json_from_output(&output)?;
         Ok(parsed)
     }
@@ -166,11 +150,10 @@ impl ConductorAgent {
     pub async fn decompose_phases(
         &mut self,
         task_description: &str,
-        callbacks: &ConductorCallbacks,
     ) -> Result<DecomposeResult, CoreError> {
         self.ensure_session()?;
         let prompt = decompose_prompt(task_description);
-        let output = self.send_and_collect(&prompt, callbacks).await?;
+        let output = self.send_and_collect(&prompt).await?;
         parse_decompose_result(&output)
     }
 
@@ -179,11 +162,10 @@ impl ConductorAgent {
         &mut self,
         task_description: &str,
         analysis_results: &[AnalysisResult],
-        callbacks: &ConductorCallbacks,
     ) -> Result<DecomposeResult, CoreError> {
         self.ensure_session()?;
         let prompt = decompose_with_analysis_prompt(task_description, analysis_results);
-        let output = self.send_and_collect(&prompt, callbacks).await?;
+        let output = self.send_and_collect(&prompt).await?;
         parse_decompose_result(&output)
     }
 
@@ -192,11 +174,10 @@ impl ConductorAgent {
         &mut self,
         phase: &Phase,
         completed_phases: &[Phase],
-        callbacks: &ConductorCallbacks,
     ) -> Result<Vec<Task>, CoreError> {
         self.ensure_session()?;
         let prompt = detail_phase_prompt(phase, completed_phases);
-        let output = self.send_and_collect(&prompt, callbacks).await?;
+        let output = self.send_and_collect(&prompt).await?;
         let parsed: serde_json::Value = parse_json_value_from_output(&output)?;
         let raw_tasks = parsed
             .get("tasks")
@@ -212,7 +193,6 @@ impl ConductorAgent {
         phase: &Phase,
         all_phases: &[Phase],
         diffs: &HashMap<usize, String>,
-        callbacks: &ConductorCallbacks,
         retry_attempt: u32,
     ) -> Result<PhaseReviewResult, CoreError> {
         // Re-create session if closed
@@ -227,7 +207,7 @@ impl ConductorAgent {
         }
 
         let prompt = phase_review_prompt(phase, all_phases, diffs, retry_attempt);
-        let output = self.send_and_collect(&prompt, callbacks).await?;
+        let output = self.send_and_collect(&prompt).await?;
         let parsed: serde_json::Value = parse_json_value_from_output(&output)?;
         let mut result = validate_phase_review_result(&parsed);
 
@@ -253,8 +233,7 @@ impl ConductorAgent {
                             status: conductor_types::PhaseStatus::Pending,
                             tasks: Vec::new(),
                             review_result: None,
-                            token_used: 0,
-                        })
+                            })
                         .collect(),
                 );
             }
@@ -269,12 +248,11 @@ impl ConductorAgent {
         &mut self,
         feedback: &str,
         images: Option<&[String]>,
-        callbacks: &ConductorCallbacks,
     ) -> Result<(Plan, String), CoreError> {
         self.ensure_session()?;
         let message = format!("{REFINE_PROMPT}\n\nUser feedback: {feedback}");
         let full_output = self
-            .send_and_collect_with_images(&message, images, callbacks)
+            .send_and_collect_with_images(&message, images)
             .await?;
 
         let json_start = full_output.find("```json");
@@ -291,17 +269,15 @@ impl ConductorAgent {
     pub async fn chat(
         &mut self,
         message: &str,
-        callbacks: &ConductorCallbacks,
     ) -> Result<String, CoreError> {
         self.ensure_session()?;
-        self.send_and_collect(message, callbacks).await
+        self.send_and_collect(message).await
     }
 
     /// Legacy flat review of completed work.
     pub async fn review(
         &mut self,
         input: &ReviewInput,
-        callbacks: &ConductorCallbacks,
     ) -> Result<ReviewResult, CoreError> {
         let prompt = review_prompt(input);
 
@@ -315,7 +291,7 @@ impl ConductorAgent {
             });
         }
 
-        let output = self.send_and_collect(&prompt, callbacks).await?;
+        let output = self.send_and_collect(&prompt).await?;
         let parsed: serde_json::Value = parse_json_value_from_output(&output)?;
 
         Ok(ReviewResult {
@@ -357,7 +333,6 @@ impl ConductorAgent {
     pub async fn review_guidance(
         &mut self,
         input: &GuidanceInput,
-        callbacks: &ConductorCallbacks,
     ) -> Result<GuidanceActions, CoreError> {
         let prompt = guidance_prompt(input);
 
@@ -371,7 +346,7 @@ impl ConductorAgent {
             });
         }
 
-        let output = self.send_and_collect(&prompt, callbacks).await?;
+        let output = self.send_and_collect(&prompt).await?;
         let parsed: GuidanceActions = parse_json_from_output(&output)?;
         Ok(parsed)
     }
@@ -386,6 +361,14 @@ impl ConductorAgent {
     }
 
     // ─── Internal ────────────────────────────────────────────────
+
+
+    /// Send output to the orchestra event channel.
+    fn emit(event_tx: &Option<mpsc::Sender<OrchestraEvent>>, line: &str) {
+        if let Some(tx) = event_tx {
+            let _ = tx.try_send(OrchestraEvent::ConductorOutput(line.to_string()));
+        }
+    }
 
     fn ensure_session(&self) -> Result<(), CoreError> {
         if !self.has_session() {
@@ -406,9 +389,8 @@ impl ConductorAgent {
     async fn send_and_collect(
         &mut self,
         message: &str,
-        callbacks: &ConductorCallbacks,
     ) -> Result<String, CoreError> {
-        self.send_and_collect_with_images(message, None, callbacks)
+        self.send_and_collect_with_images(message, None)
             .await
     }
 
@@ -417,7 +399,6 @@ impl ConductorAgent {
         &mut self,
         message: &str,
         images: Option<&[String]>,
-        callbacks: &ConductorCallbacks,
     ) -> Result<String, CoreError> {
         self.prompts_sent.push(message.to_string());
 
@@ -446,12 +427,8 @@ impl ConductorAgent {
 
         // Collect events until a Result event signals turn completion
         let event_rx = self.event_rx.as_mut().unwrap();
+        let event_tx = self.event_tx.clone();
         let mut full_output = String::new();
-        let mut estimated = TokenUsage::default();
-
-        if let Some(ref f) = callbacks.on_estimated_change {
-            f(true);
-        }
 
         let timeout = tokio::time::Duration::from_secs(300); // 5 minutes
         let deadline = tokio::time::Instant::now() + timeout;
@@ -482,98 +459,39 @@ impl ConductorAgent {
             match event.event_type {
                 ClaudeEventType::Assistant => {
                     if event.subtype.as_deref() == Some("thinking") {
-                        if let Some(ref f) = callbacks.on_output {
-                            f("Thinking...");
-                        }
+                        Self::emit(&event_tx, "Thinking...");
                     } else if let Some(ref msg) = event.message {
                         full_output.push_str(msg);
-                        let est_out = estimate_tokens(msg);
-                        estimated.output += est_out;
-                        if let Some(ref f) = callbacks.on_tokens {
-                            f(&TokenUsage {
-                                input: 0,
-                                output: est_out,
-                                cache_read: 0,
-                                cache_creation: 0,
-                            });
-                        }
-                        if let Some(ref f) = callbacks.on_output {
-                            for line in msg.lines() {
-                                let trimmed = line.trim();
-                                if !trimmed.is_empty() {
-                                    f(trimmed);
-                                }
+                        for line in msg.lines() {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                Self::emit(&event_tx, trimmed);
                             }
                         }
                     }
                 }
                 ClaudeEventType::ToolUse => {
-                    if let Some(ref f) = callbacks.on_output {
-                        let summary = summarize_tool_use(
-                            event.tool_name.as_deref().unwrap_or(""),
-                            event.tool_input.as_ref(),
-                        );
-                        f(&format!("> {summary}"));
-                    }
-                    if let Some(ref input) = event.tool_input {
-                        let est_out = estimate_tokens(&input.to_string());
-                        estimated.output += est_out;
-                        if let Some(ref f) = callbacks.on_tokens {
-                            f(&TokenUsage {
-                                input: 0,
-                                output: est_out,
-                                cache_read: 0,
-                                cache_creation: 0,
-                            });
-                        }
-                    }
+                    let summary = summarize_tool_use(
+                        event.tool_name.as_deref().unwrap_or(""),
+                        event.tool_input.as_ref(),
+                    );
+                    Self::emit(&event_tx, &format!("> {summary}"));
                 }
-                ClaudeEventType::ToolResult => {
-                    if let Some(ref content) = event.tool_result_content {
-                        let est_in = estimate_tokens(content);
-                        estimated.input += est_in;
-                        if let Some(ref f) = callbacks.on_tokens {
-                            f(&TokenUsage {
-                                input: est_in,
-                                output: 0,
-                                cache_read: 0,
-                                cache_creation: 0,
-                            });
-                        }
-                    }
-                }
+                ClaudeEventType::ToolResult => {}
                 ClaudeEventType::Result => {
                     if let Some(ref result_text) = event.result {
                         full_output.push_str(result_text);
                     }
-                    if let Some(cost) = event.cost_usd {
-                        self.total_cost_usd += cost;
-                    }
-                    if let Some(ref usage) = event.usage {
-                        let delta = TokenUsage {
-                            input: usage.input.saturating_sub(estimated.input),
-                            output: usage.output.saturating_sub(estimated.output),
-                            cache_read: usage.cache_read.saturating_sub(estimated.cache_read),
-                            cache_creation: usage
-                                .cache_creation
-                                .saturating_sub(estimated.cache_creation),
-                        };
-                        if let Some(ref f) = callbacks.on_tokens {
-                            f(&delta);
-                        }
-                        if let Some(ref f) = callbacks.on_estimated_change {
-                            f(false);
-                        }
-                    }
                     break;
                 }
                 ClaudeEventType::Error => {
-                    if let Some(ref f) = callbacks.on_output {
-                        f(&format!(
+                    Self::emit(
+                        &event_tx,
+                        &format!(
                             "Error: {}",
                             event.message.as_deref().unwrap_or("Unknown error")
-                        ));
-                    }
+                        ),
+                    );
                 }
                 _ => {}
             }
@@ -971,10 +889,6 @@ fn parse_plan_from_output(output: &str) -> Result<Plan, CoreError> {
                     .collect()
             })
             .unwrap_or_default(),
-        estimated_tokens: parsed
-            .get("estimatedTokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
         estimated_minutes: parsed
             .get("estimatedMinutes")
             .and_then(|v| v.as_u64())
@@ -1015,7 +929,6 @@ fn parse_decompose_result(output: &str) -> Result<DecomposeResult, CoreError> {
                         status: conductor_types::PhaseStatus::Pending,
                         tasks: parse_tasks(&raw_tasks),
                         review_result: None,
-                        token_used: 0,
                     }
                 })
                 .collect()
@@ -1043,10 +956,6 @@ fn parse_decompose_result(output: &str) -> Result<DecomposeResult, CoreError> {
             })
             .unwrap_or_default(),
         insights,
-        estimated_tokens: parsed
-            .get("estimatedTokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
         estimated_minutes: parsed
             .get("estimatedMinutes")
             .and_then(|v| v.as_u64())
@@ -2032,7 +1941,6 @@ mod tests {
         let agent = ConductorAgent::new("opus".into(), "/tmp".into());
         assert!(!agent.has_session());
         assert!(agent.prompts_sent.is_empty());
-        assert_eq!(agent.total_cost_usd, 0.0);
     }
 
     #[test]

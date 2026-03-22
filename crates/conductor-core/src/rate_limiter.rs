@@ -186,14 +186,11 @@ mod tests {
             tool_input: None,
             tool_result_content: None,
             result: None,
-            cost_usd: None,
-            total_cost_usd: None,
             duration_ms: None,
             duration_api_ms: None,
             num_turns: None,
             is_error: None,
             resets_at: Some("2026-01-01T00:05:00Z".into()),
-            usage: None,
         };
         assert!(rl.handle_event(&event));
         assert!(rl.is_limited());
@@ -212,14 +209,11 @@ mod tests {
             tool_input: None,
             tool_result_content: None,
             result: None,
-            cost_usd: None,
-            total_cost_usd: None,
             duration_ms: None,
             duration_api_ms: None,
             num_turns: None,
             is_error: None,
             resets_at: None,
-            usage: None,
         };
         assert!(rl.handle_event(&event));  // first time → true
         assert!(!rl.handle_event(&event)); // already limited → false

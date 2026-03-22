@@ -66,13 +66,10 @@ pub struct OrchestraState {
     pub elapsed_ms: u64,
     pub conductor_output: Vec<String>,
     pub conductor_prompts: Vec<String>,
-    pub tokens: TokenUsage,
-    pub tokens_estimated: bool,
     pub guidance_queue_size: usize,
     pub plan_validation: Option<PlanValidation>,
     pub refinement_history: Vec<PlanRefinementMessage>,
     pub insights: Vec<Insight>,
-    pub total_cost_usd: f64,
 }
 
 impl OrchestraState {
@@ -92,13 +89,10 @@ impl OrchestraState {
             elapsed_ms: 0,
             conductor_output: Vec::new(),
             conductor_prompts: Vec::new(),
-            tokens: TokenUsage::default(),
-            tokens_estimated: false,
             guidance_queue_size: 0,
             plan_validation: None,
             refinement_history: Vec::new(),
             insights: Vec::new(),
-            total_cost_usd: 0.0,
         }
     }
 }
@@ -146,7 +140,6 @@ pub struct TaskResult {
     pub files_modified: Vec<String>,
     pub summary: String,
     pub error: Option<String>,
-    pub tokens_used: u64,
     pub duration_ms: u64,
     pub diff: Option<String>,
     pub verification_output: Option<String>,
@@ -178,7 +171,6 @@ pub struct Phase {
     pub status: PhaseStatus,
     pub tasks: Vec<Task>,
     pub review_result: Option<PhaseReviewResult>,
-    pub token_used: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,7 +196,6 @@ pub struct Checkpoint {
     pub turn_number: u32,
     pub files_modified: Vec<String>,
     pub timestamp: String,
-    pub token_used: u64,
     pub commit_sha: Option<String>,
 }
 
@@ -252,7 +243,6 @@ pub struct AnalysisResult {
     pub key_files: Vec<String>,
     pub patterns: Vec<String>,
     pub risks: Vec<String>,
-    pub tokens_used: u64,
     pub duration_ms: u64,
 }
 
@@ -263,9 +253,6 @@ pub struct AnalystState {
     pub status: MusicianStatus,
     pub directive: Option<AnalysisDirective>,
     pub output_lines: Vec<String>,
-    pub tokens_used: u64,
-    pub token_usage: TokenUsage,
-    pub tokens_estimated: bool,
     pub started_at: Option<String>,
     pub elapsed_ms: u64,
 }
@@ -295,16 +282,12 @@ pub struct MusicianState {
     pub status: MusicianStatus,
     pub current_task: Option<Task>,
     pub output_lines: Vec<String>,
-    pub tokens_used: u64,
-    pub token_usage: TokenUsage,
-    pub tokens_estimated: bool,
     pub started_at: Option<String>,
     pub elapsed_ms: u64,
     pub worktree_path: Option<String>,
     pub branch: Option<String>,
     pub checkpoint: Option<Checkpoint>,
     pub prompt_sent: Option<String>,
-    pub cost_usd: f64,
 }
 
 // ─── Codebase Map ────────────────────────────────────────────────
@@ -336,7 +319,6 @@ pub struct Plan {
     pub dependency_graph: String,
     pub musician_assignment: String,
     pub learning_notes: Vec<String>,
-    pub estimated_tokens: u64,
     pub estimated_minutes: u32,
     pub insights: Option<Vec<PlanInsight>>,
 }
@@ -406,16 +388,6 @@ pub struct TaskModification {
     pub new_description: String,
 }
 
-// ─── Token Usage ─────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TokenUsage {
-    pub input: u64,
-    pub output: u64,
-    pub cache_read: u64,
-    pub cache_creation: u64,
-}
-
 // ─── Claude Bridge Events ────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -438,14 +410,11 @@ pub struct ClaudeEvent {
     pub tool_input: Option<serde_json::Value>,
     pub tool_result_content: Option<String>,
     pub result: Option<String>,
-    pub cost_usd: Option<f64>,
-    pub total_cost_usd: Option<f64>,
     pub duration_ms: Option<u64>,
     pub duration_api_ms: Option<u64>,
     pub num_turns: Option<u32>,
     pub is_error: Option<bool>,
     pub resets_at: Option<String>,
-    pub usage: Option<TokenUsage>,
 }
 
 // ─── Rate Limiting ───────────────────────────────────────────────
@@ -537,8 +506,6 @@ pub struct SessionData {
     pub phase: OrchestraPhase,
     pub started_at: String,
     pub last_updated_at: String,
-    pub tokens: TokenUsage,
-    pub tokens_estimated: bool,
     pub tasks: Vec<Task>,
     pub phases: Option<Vec<Phase>>,
     pub current_phase_index: Option<i32>,
@@ -603,7 +570,6 @@ mod tests {
             files_modified: vec!["src/lib.rs".into()],
             summary: "Done".into(),
             error: None,
-            tokens_used: 1000,
             duration_ms: 5000,
             diff: Some("+added line".into()),
             verification_output: Some("ok".into()),
@@ -623,14 +589,11 @@ mod tests {
             tool_input: None,
             tool_result_content: None,
             result: Some("done".into()),
-            cost_usd: Some(0.05),
-            total_cost_usd: Some(0.10),
             duration_ms: Some(3000),
             duration_api_ms: Some(2500),
             num_turns: Some(3),
             is_error: Some(false),
             resets_at: None,
-            usage: Some(TokenUsage { input: 100, output: 50, cache_read: 0, cache_creation: 0 }),
         };
         round_trip(&event);
     }
@@ -643,8 +606,6 @@ mod tests {
             phase: OrchestraPhase::Init,
             started_at: "2026-01-01T00:00:00Z".into(),
             last_updated_at: "2026-01-01T00:01:00Z".into(),
-            tokens: TokenUsage::default(),
-            tokens_estimated: false,
             tasks: vec![],
             phases: None,
             current_phase_index: None,
@@ -663,7 +624,6 @@ mod tests {
             status: PhaseStatus::Pending,
             tasks: vec![],
             review_result: None,
-            token_used: 0,
         };
         round_trip(&phase);
     }
@@ -678,21 +638,11 @@ mod tests {
     }
 
     #[test]
-    fn token_usage_default_is_zero() {
-        let t = TokenUsage::default();
-        assert_eq!(t.input, 0);
-        assert_eq!(t.output, 0);
-        assert_eq!(t.cache_read, 0);
-        assert_eq!(t.cache_creation, 0);
-    }
-
-    #[test]
     fn orchestra_state_new_defaults() {
         let state = OrchestraState::new(sample_config());
         assert_eq!(state.phase, OrchestraPhase::Init);
         assert_eq!(state.current_phase_index, -1);
         assert!(state.tasks.is_empty());
         assert!(state.musicians.is_empty());
-        assert_eq!(state.total_cost_usd, 0.0);
     }
 }

@@ -12,7 +12,6 @@ pub mod musician;
 pub mod orchestra;
 pub mod rate_limiter;
 pub mod task_store;
-pub mod token_estimate;
 pub mod tool_summary;
 pub mod worktree_manager;
 

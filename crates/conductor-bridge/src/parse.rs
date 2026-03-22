@@ -1,4 +1,4 @@
-use conductor_types::{ClaudeEvent, ClaudeEventType, TokenUsage};
+use conductor_types::{ClaudeEvent, ClaudeEventType};
 use serde_json::Value;
 
 /// Helper to create a ClaudeEvent with all fields set to None.
@@ -12,14 +12,11 @@ fn empty_event(event_type: ClaudeEventType) -> ClaudeEvent {
         tool_input: None,
         tool_result_content: None,
         result: None,
-        cost_usd: None,
-        total_cost_usd: None,
         duration_ms: None,
         duration_api_ms: None,
         num_turns: None,
         is_error: None,
         resets_at: None,
-        usage: None,
     }
 }
 
@@ -132,33 +129,10 @@ pub fn parse_claude_event(raw: &Value) -> Vec<ClaudeEvent> {
             let mut ev = empty_event(ClaudeEventType::Result);
             ev.subtype = raw.get("subtype").and_then(|v| v.as_str()).map(String::from);
             ev.result = raw.get("result").and_then(|v| v.as_str()).map(String::from);
-            ev.cost_usd = raw.get("total_cost_usd").and_then(|v| v.as_f64());
-            ev.total_cost_usd = raw.get("total_cost_usd").and_then(|v| v.as_f64());
             ev.duration_ms = raw.get("duration_ms").and_then(|v| v.as_u64());
             ev.duration_api_ms = raw.get("duration_api_ms").and_then(|v| v.as_u64());
             ev.num_turns = raw.get("num_turns").and_then(|v| v.as_u64()).map(|n| n as u32);
             ev.is_error = raw.get("is_error").and_then(|v| v.as_bool());
-
-            if let Some(usage) = raw.get("usage") {
-                ev.usage = Some(TokenUsage {
-                    input: usage
-                        .get("input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    output: usage
-                        .get("output_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    cache_read: usage
-                        .get("cache_read_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    cache_creation: usage
-                        .get("cache_creation_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                });
-            }
             vec![ev]
         }
 
@@ -264,32 +238,19 @@ mod tests {
             "type": "result",
             "subtype": "success",
             "result": "Task completed",
-            "total_cost_usd": 0.05,
             "duration_ms": 3000,
             "duration_api_ms": 2500,
             "num_turns": 3,
-            "is_error": false,
-            "usage": {
-                "input_tokens": 1000,
-                "output_tokens": 500,
-                "cache_read_input_tokens": 200,
-                "cache_creation_input_tokens": 100
-            }
+            "is_error": false
         });
         let events = parse_claude_event(&raw);
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.event_type, ClaudeEventType::Result);
         assert_eq!(ev.result.as_deref(), Some("Task completed"));
-        assert_eq!(ev.total_cost_usd, Some(0.05));
         assert_eq!(ev.duration_ms, Some(3000));
         assert_eq!(ev.num_turns, Some(3));
         assert_eq!(ev.is_error, Some(false));
-        let usage = ev.usage.as_ref().unwrap();
-        assert_eq!(usage.input, 1000);
-        assert_eq!(usage.output, 500);
-        assert_eq!(usage.cache_read, 200);
-        assert_eq!(usage.cache_creation, 100);
     }
 
     #[test]

@@ -388,8 +388,6 @@ mod tests {
             phase: conductor_types::OrchestraPhase::Init,
             started_at: "2026-01-01T00:00:00Z".into(),
             last_updated_at: "2026-01-01T00:01:00Z".into(),
-            tokens: conductor_types::TokenUsage::default(),
-            tokens_estimated: false,
             tasks: vec![],
             phases: None,
             current_phase_index: None,

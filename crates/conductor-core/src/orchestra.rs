@@ -9,23 +9,23 @@
 //! - `tokio::sync::mpsc` for user → orchestra actions
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
 use conductor_types::{
     AnalysisResult, AnalystState, CodebaseMap, GuidanceActions, GuidanceInput, GuidanceMessage,
     Insight, InsightCategory, MusicianState, MusicianStatus, OrchestraConfig,
     OrchestraEvent, OrchestraPhase, OrchestraState, Phase, PhaseReviewAction, PhaseStatus, Plan,
     PlanRefinementMessage, PlanValidation, RefinementRole, Task, TaskResult,
-    TaskStatus, TokenUsage, UserAction, WorktreeSnapshot, WorktreeStatus,
+    TaskStatus, UserAction, WorktreeSnapshot, WorktreeStatus,
 };
 use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use crate::caffeinate::Caffeinate;
-use crate::conductor_agent::{
-    ConductorAgent, ConductorCallbacks, ReviewInput,
-};
+use crate::conductor_agent::{ConductorAgent, ReviewInput};
 use crate::dag::validate_plan;
 use crate::insights::InsightGenerator;
 use crate::memory::SharedMemory;
@@ -150,7 +150,7 @@ pub struct Orchestra {
     worktree_snapshots: Vec<WorktreeSnapshot>,
 
     // Services (owned)
-    conductor: ConductorAgent,
+    conductor: Option<ConductorAgent>,
     rate_limiter: RateLimiter,
     task_store: TaskStore,
     memory: SharedMemory,
@@ -159,9 +159,6 @@ pub struct Orchestra {
     caffeinate: Caffeinate,
 
     // Tracking
-    tokens: TokenUsage,
-    tokens_estimated: bool,
-    total_cost_usd: f64,
     review_retry_count: u32,
     conductor_output: Vec<String>,
     started_at: String,
@@ -213,10 +210,11 @@ impl Orchestra {
         let memory_path = task_store.base_path().join("memory").join("SHARED.md");
         let memory = SharedMemory::new(memory_path);
 
-        let conductor = ConductorAgent::new(
+        let mut conductor = ConductorAgent::new(
             config.conductor_model.clone(),
             config.project_path.clone(),
         );
+        conductor.set_event_tx(event_tx.clone());
         let rate_limiter = RateLimiter::new(None);
         let worktree_manager = WorktreeManager::new(&config.project_path);
         let insight_generator = InsightGenerator::new();
@@ -244,16 +242,13 @@ impl Orchestra {
             analysis_results: Vec::new(),
             codebase_map: None,
             worktree_snapshots: Vec::new(),
-            conductor,
+            conductor: Some(conductor),
             rate_limiter,
             task_store,
             memory,
             worktree_manager,
             insight_generator,
             caffeinate,
-            tokens: TokenUsage::default(),
-            tokens_estimated: false,
-            total_cost_usd: 0.0,
             review_retry_count: 0,
             conductor_output: Vec::new(),
             started_at: chrono::Utc::now().to_rfc3339(),
@@ -277,22 +272,6 @@ impl Orchestra {
 
     /// Build and broadcast the current OrchestraState.
     fn broadcast_state(&mut self) {
-        // Compute live tokens: accumulated + running musicians
-        let mut live_tokens = self.tokens.clone();
-        let mut any_estimated = self.tokens_estimated;
-
-        for ms in &self.musician_states {
-            if ms.status == MusicianStatus::Running && self.active_musicians.contains_key(&ms.id) {
-                live_tokens.input += ms.token_usage.input;
-                live_tokens.output += ms.token_usage.output;
-                live_tokens.cache_read += ms.token_usage.cache_read;
-                live_tokens.cache_creation += ms.token_usage.cache_creation;
-                if ms.tokens_estimated {
-                    any_estimated = true;
-                }
-            }
-        }
-
         self.state = OrchestraState {
             phase: self.phase.clone(),
             config: self.config.clone(),
@@ -307,16 +286,11 @@ impl Orchestra {
             started_at: self.started_at.clone(),
             elapsed_ms: elapsed_since(&self.started_at),
             conductor_output: self.conductor_output.clone(),
-            conductor_prompts: self.conductor.prompts_sent.clone(),
-            tokens: live_tokens,
-            tokens_estimated: any_estimated,
+            conductor_prompts: self.conductor.as_ref().map(|c| c.prompts_sent.clone()).unwrap_or_default(),
             guidance_queue_size: self.guidance_queue.len(),
             plan_validation: self.plan_validation.clone(),
             refinement_history: self.refinement_history.clone(),
             insights: self.insight_generator.get_all_insights().to_vec(),
-            total_cost_usd: self.total_cost_usd
-                + self.conductor.total_cost_usd
-                + self.musician_states.iter().map(|ms| ms.cost_usd).sum::<f64>(),
         };
 
         let _ = self.state_tx.send(self.state.clone());
@@ -335,11 +309,58 @@ impl Orchestra {
         }
     }
 
-    /// Build callbacks for conductor agent calls.
-    fn make_callbacks(&self) -> ConductorCallbacks {
-        // We can't capture &mut self in closures, so we use a simpler approach:
-        // callbacks are no-ops and we handle output/tokens in the caller.
-        ConductorCallbacks::default()
+    /// Take the conductor out for use in a spawned task.
+    fn take_conductor(&mut self) -> ConductorAgent {
+        self.conductor.take().expect("conductor already taken")
+    }
+
+    /// Return the conductor after a spawned task completes.
+    fn return_conductor(&mut self, conductor: ConductorAgent) {
+        self.conductor = Some(conductor);
+    }
+
+    /// Run a conductor operation concurrently with event processing.
+    ///
+    /// Takes the conductor out, spawns `op` on a tokio task, and runs a
+    /// mini event loop that processes orchestra events (including ConductorOutput)
+    /// and broadcasts state updates to the TUI in real-time.
+    async fn run_conductor_op<F, T>(&mut self, op: F) -> Result<T, CoreError>
+    where
+        F: FnOnce(ConductorAgent) -> Pin<Box<dyn Future<Output = (ConductorAgent, Result<T, CoreError>)> + Send>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conductor = self.take_conductor();
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let result = op(conductor).await;
+            let _ = result_tx.send(result);
+        });
+
+        // Take event_rx to drain events while conductor runs
+        let mut event_rx = self.event_rx.take().expect("event_rx already taken");
+
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut result_rx => {
+                    let (conductor, op_result) = result
+                        .map_err(|_| CoreError::Channel("conductor op cancelled".into()))?;
+                    self.return_conductor(conductor);
+                    // Drain any remaining events before returning
+                    while let Ok(event) = event_rx.try_recv() {
+                        self.handle_event(event).await;
+                    }
+                    self.event_rx = Some(event_rx);
+                    self.broadcast_state();
+                    return op_result;
+                }
+                Some(event) = event_rx.recv() => {
+                    self.handle_event(event).await;
+                    self.broadcast_state();
+                }
+            }
+        }
     }
 
     // ─── Main Entry Point ──────────────────────────────────────
@@ -455,20 +476,12 @@ impl Orchestra {
                 musician_id,
                 result,
             } => {
-                // Accumulate tokens from completed musician
-                if let Some(ms) = self.musician_states.iter().find(|m| m.id == musician_id) {
-                    self.tokens.input += ms.token_usage.input;
-                    self.tokens.output += ms.token_usage.output;
-                    self.tokens.cache_read += ms.token_usage.cache_read;
-                    self.tokens.cache_creation += ms.token_usage.cache_creation;
-                }
                 self.active_musicians.remove(&musician_id);
                 self.active_start_times.remove(&musician_id);
 
                 tracing::info!(
                     musician = %musician_id,
                     success = result.success,
-                    tokens = result.tokens_used,
                     "musician completed"
                 );
             }
@@ -586,17 +599,18 @@ impl Orchestra {
         self.push_conductor_output("Pass 1/3: Exploring codebase...");
         self.broadcast_state();
 
-        let cb = self.make_callbacks();
-        match self
-            .conductor
-            .explore(
-                &self.config.project_path,
-                &self.config.task_description,
-                &cb,
-                reference_context.as_deref(),
-            )
-            .await
-        {
+        let project_path = self.config.project_path.clone();
+        let task_desc = self.config.task_description.clone();
+        let ref_ctx = reference_context.clone();
+
+        let explore_result = self.run_conductor_op(move |mut conductor| {
+            Box::pin(async move {
+                let result = conductor.explore(&project_path, &task_desc, ref_ctx.as_deref()).await;
+                (conductor, result)
+            })
+        }).await;
+
+        match explore_result {
             Ok(map) => {
                 self.push_conductor_output("Exploration complete.");
                 self.codebase_map = Some(map);
@@ -630,20 +644,19 @@ impl Orchestra {
         self.push_conductor_output(&format!("{pass_label}: Decomposing into phases..."));
         self.broadcast_state();
 
-        let cb = self.make_callbacks();
-        let decomposition = if !self.analysis_results.is_empty() {
-            self.conductor
-                .decompose_with_analysis(
-                    &self.config.task_description,
-                    &self.analysis_results,
-                    &cb,
-                )
-                .await?
-        } else {
-            self.conductor
-                .decompose_phases(&self.config.task_description, &cb)
-                .await?
-        };
+        let task_desc = self.config.task_description.clone();
+        let analysis_results = self.analysis_results.clone();
+
+        let decomposition = self.run_conductor_op(move |mut conductor| {
+            Box::pin(async move {
+                let result = if !analysis_results.is_empty() {
+                    conductor.decompose_with_analysis(&task_desc, &analysis_results).await
+                } else {
+                    conductor.decompose_phases(&task_desc).await
+                };
+                (conductor, result)
+            })
+        }).await?;
 
         self.phases = decomposition.phases;
 
@@ -670,7 +683,6 @@ impl Orchestra {
                 .join("\n"),
             musician_assignment: String::new(),
             learning_notes: decomposition.learning_notes.clone(),
-            estimated_tokens: decomposition.estimated_tokens,
             estimated_minutes: decomposition.estimated_minutes,
             insights: decomposition.insights.clone(),
         });
@@ -714,14 +726,15 @@ impl Orchestra {
         }
 
         self.task_store.save_tasks(&self.tasks).await?;
-        self.persist_state().await?;
 
         if self.config.dry_run {
             self.set_phase(OrchestraPhase::Complete);
+            self.persist_state().await?;
             return Ok(());
         }
 
         self.set_phase(OrchestraPhase::PlanReview);
+        self.persist_state().await?;
 
         // In headless mode, auto-approve the plan and start execution immediately
         // instead of waiting for a UserAction::ApprovePlan that will never come.
@@ -763,9 +776,6 @@ impl Orchestra {
                 status: MusicianStatus::Running,
                 directive: Some(d.clone()),
                 output_lines: Vec::new(),
-                tokens_used: 0,
-                token_usage: TokenUsage::default(),
-                tokens_estimated: true,
                 started_at: Some(chrono::Utc::now().to_rfc3339()),
                 elapsed_ms: 0,
             })
@@ -821,13 +831,11 @@ impl Orchestra {
                         key_files: Vec::new(),
                         patterns: Vec::new(),
                         risks: Vec::new(),
-                        tokens_used: result.tokens_used,
                         duration_ms: result.duration_ms,
                     });
                     if i < self.analyst_states.len() {
                         self.analyst_states[i].status = MusicianStatus::Completed;
                     }
-                    self.tokens.input += result.tokens_used;
                 }
                 Ok(result) => {
                     self.push_conductor_output(&format!(
@@ -880,8 +888,15 @@ impl Orchestra {
         self.set_phase(OrchestraPhase::Planning);
         self.conductor_output.clear();
 
-        let cb = self.make_callbacks();
-        let (plan, explanation) = self.conductor.refine_plan(feedback, images, &cb).await?;
+        let feedback_owned = feedback.to_string();
+        let images_owned = images.map(|i| i.to_vec());
+
+        let (plan, explanation) = self.run_conductor_op(move |mut conductor| {
+            Box::pin(async move {
+                let result = conductor.refine_plan(&feedback_owned, images_owned.as_deref()).await;
+                (conductor, result)
+            })
+        }).await?;
 
         self.refinement_history.push(PlanRefinementMessage {
             role: RefinementRole::Conductor,
@@ -1225,12 +1240,14 @@ impl Orchestra {
                 ));
                 self.broadcast_state();
 
-                let cb = self.make_callbacks();
                 let phase_ref = self.phases[pi].clone();
-                let detailed_tasks = self
-                    .conductor
-                    .detail_phase(&phase_ref, &completed_phases, &cb)
-                    .await?;
+                let completed_ref = completed_phases.clone();
+                let detailed_tasks = self.run_conductor_op(move |mut conductor| {
+                    Box::pin(async move {
+                        let result = conductor.detail_phase(&phase_ref, &completed_ref).await;
+                        (conductor, result)
+                    })
+                }).await?;
 
                 let base_index = self.tasks.len();
                 for (ti, mut task) in detailed_tasks.into_iter().enumerate() {
@@ -1263,15 +1280,6 @@ impl Orchestra {
             self.execute_loop().await?;
             self.current_phase_tasks = None;
 
-            // Track phase tokens
-            let phase_tokens: u64 = self.phases[pi]
-                .tasks
-                .iter()
-                .filter_map(|t| t.result.as_ref())
-                .map(|r| r.tokens_used)
-                .sum();
-            self.phases[pi].token_used = phase_tokens;
-
             // 3. Phase merging checkpoint
             self.set_phase(OrchestraPhase::PhaseMerging);
 
@@ -1287,15 +1295,16 @@ impl Orchestra {
                 }
             }
 
-            let cb = self.make_callbacks();
             let phase_ref = self.phases[pi].clone();
             let all_phases = self.phases.clone();
             let retry_count = *phase_retry_count.get(&pi).unwrap_or(&0);
 
-            let review = self
-                .conductor
-                .review_phase(&phase_ref, &all_phases, &phase_diffs, &cb, retry_count)
-                .await?;
+            let review = self.run_conductor_op(move |mut conductor| {
+                Box::pin(async move {
+                    let result = conductor.review_phase(&phase_ref, &all_phases, &phase_diffs, retry_count).await;
+                    (conductor, result)
+                })
+            }).await?;
 
             self.phases[pi].review_result = Some(review.clone());
 
@@ -1453,8 +1462,12 @@ impl Orchestra {
             verification_results: Some(verification_results),
         };
 
-        let cb = self.make_callbacks();
-        let review = self.conductor.review(&input, &cb).await?;
+        let review = self.run_conductor_op(move |mut conductor| {
+            Box::pin(async move {
+                let result = conductor.review(&input).await;
+                (conductor, result)
+            })
+        }).await?;
 
         self.insight_generator.on_conductor_decision(
             &format!("Review: {}", review.action),
@@ -1602,8 +1615,7 @@ impl Orchestra {
             shared_memory: shared_mem,
         };
 
-        let cb = self.make_callbacks();
-        self.conductor.review_guidance(&input, &cb).await
+        self.conductor.as_mut().unwrap().review_guidance(&input).await
     }
 
     async fn apply_guidance_actions(&mut self, actions: GuidanceActions) {
@@ -1618,7 +1630,6 @@ impl Orchestra {
                             files_modified: Vec::new(),
                             summary: "Cancelled by user guidance".into(),
                             error: None,
-                            tokens_used: 0,
                             duration_ms: 0,
                             diff: None,
                             verification_output: None,
@@ -1771,7 +1782,6 @@ impl Orchestra {
                         dep_title
                     ),
                     error: Some(format!("dependency_failed:{dep_idx}")),
-                    tokens_used: 0,
                     duration_ms: 0,
                     diff: None,
                     verification_output: None,
@@ -1891,8 +1901,6 @@ impl Orchestra {
             phase: self.phase.clone(),
             started_at: self.started_at.clone(),
             last_updated_at: chrono::Utc::now().to_rfc3339(),
-            tokens: self.tokens.clone(),
-            tokens_estimated: self.tokens_estimated,
             tasks: self.tasks.clone(),
             phases: if self.phases.is_empty() {
                 None
@@ -1918,7 +1926,9 @@ impl Orchestra {
     /// Graceful shutdown — persist state and cleanup.
     pub async fn shutdown(&mut self) {
         let _ = self.persist_state().await;
-        self.conductor.close().await;
+        if let Some(ref mut conductor) = self.conductor {
+            conductor.close().await;
+        }
         self.caffeinate.stop().await;
     }
 

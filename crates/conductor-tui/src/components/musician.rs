@@ -131,13 +131,8 @@ fn render_musician_column(
     let output = Paragraph::new(lines).scroll((scroll_offset, 0));
     f.render_widget(output, output_area);
 
-    // Stats line: tokens + elapsed
-    let tok = theme::format_tokens(musician.tokens_used, musician.tokens_estimated);
+    // Stats line: elapsed
     let elapsed = theme::elapsed(musician.elapsed_ms);
-    let stats = Line::from(vec![
-        Span::styled(tok, Style::default().fg(C_DIM)),
-        Span::styled("  ", Style::default()),
-        Span::styled(elapsed, Style::default().fg(C_DIM)),
-    ]);
+    let stats = Line::from(Span::styled(elapsed, Style::default().fg(C_DIM)));
     f.render_widget(Paragraph::new(stats), stats_area);
 }

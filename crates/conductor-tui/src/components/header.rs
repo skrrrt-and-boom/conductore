@@ -1,8 +1,8 @@
-//! Top status bar — time, phase, task progress, musicians, tokens, cost.
+//! Top status bar — time, phase, task progress, musicians.
 
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -23,9 +23,6 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &OrchestraState) {
         .filter(|t| t.status == TaskStatus::Completed)
         .count();
     let total = state.tasks.len();
-
-    // Total tokens (input + output)
-    let total_tokens = state.tokens.input + state.tokens.output;
 
     // Musician model summary
     let musician_count = state.musicians.len();
@@ -58,28 +55,11 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &OrchestraState) {
         ));
     }
 
-    // Tokens
-    if total_tokens > 0 {
-        let tok_color = if state.tokens_estimated { C_DIM } else { C_TEXT };
-        spans.push(Span::styled(
-            format!("{}  ", theme::format_tokens(total_tokens, state.tokens_estimated)),
-            Style::default().fg(tok_color),
-        ));
-    }
-
     // Elapsed
     if state.elapsed_ms > 0 {
         spans.push(Span::styled(
             format!("{}  ", theme::elapsed(state.elapsed_ms)),
             Style::default().fg(C_TEXT),
-        ));
-    }
-
-    // Cost
-    if state.total_cost_usd > 0.0 {
-        spans.push(Span::styled(
-            format!("${:.2}  ", state.total_cost_usd),
-            Style::default().fg(Color::Green),
         ));
     }
 

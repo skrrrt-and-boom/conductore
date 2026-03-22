@@ -183,23 +183,18 @@ mod tests {
     use conductor_types::state::MusicianState;
 
     fn make_musician(status: MusicianStatus) -> MusicianState {
-        use conductor_types::state::TokenUsage;
         MusicianState {
             id: String::new(),
             index: 0,
             status,
             current_task: None,
             output_lines: vec![],
-            tokens_used: 0,
-            token_usage: TokenUsage { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
-            tokens_estimated: false,
             started_at: None,
             elapsed_ms: 0,
             worktree_path: None,
             branch: None,
             checkpoint: None,
             prompt_sent: None,
-            cost_usd: 0.0,
         }
     }
 

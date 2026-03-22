@@ -67,10 +67,9 @@ pub fn render_plan_review(
             )),
             Line::from(Span::styled(
                 format!(
-                    "{} tasks · ~{} min · ~{} tokens",
+                    "{} tasks · ~{} min",
                     tasks.len(),
                     plan.estimated_minutes,
-                    theme::format_tokens(plan.estimated_tokens, true)
                 ),
                 Style::default().fg(C_DIM),
             )),
@@ -189,7 +188,7 @@ pub fn render_session_browser(
         return;
     }
 
-    let header = Row::new(["ID", "Phase", "Tasks", "Tokens"])
+    let header = Row::new(["ID", "Phase", "Tasks"])
         .style(Style::default().fg(C_DIM).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = sessions
@@ -202,12 +201,10 @@ pub fn render_session_browser(
                 Style::default().fg(C_TEXT)
             };
 
-            let total_tokens = s.tokens.input + s.tokens.output;
             Row::new([
                 theme::trunc(&s.id, 8),
                 format!("{:?}", s.phase),
                 format!("{}", s.tasks.len()),
-                theme::format_tokens(total_tokens, s.tokens_estimated),
             ])
             .style(style)
         })
@@ -217,7 +214,6 @@ pub fn render_session_browser(
         Constraint::Length(10),
         Constraint::Length(14),
         Constraint::Length(6),
-        Constraint::Length(10),
     ];
 
     let table = Table::new(rows, widths)

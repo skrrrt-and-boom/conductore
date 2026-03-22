@@ -110,14 +110,11 @@ impl ClaudeSession {
                     tool_input: None,
                     tool_result_content: None,
                     result: None,
-                    cost_usd: None,
-                    total_cost_usd: None,
                     duration_ms: None,
                     duration_api_ms: None,
                     num_turns: None,
                     is_error: None,
                     resets_at: None,
-                    usage: None,
                 };
                 let _ = stderr_tx.send(ev).await;
             }
