@@ -219,14 +219,58 @@ impl TuiApp {
                     ui.prompt_input.clear();
                     ui.prompt_cursor = 0;
                 }
+                // Option+Backspace: delete word backward
+                KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                    if ui.prompt_cursor > 0 {
+                        let old_cursor = ui.prompt_cursor;
+                        while ui.prompt_cursor > 0
+                            && ui.prompt_input.as_bytes()[ui.prompt_cursor - 1] == b' '
+                        {
+                            ui.prompt_cursor -= 1;
+                        }
+                        while ui.prompt_cursor > 0
+                            && ui.prompt_input.as_bytes()[ui.prompt_cursor - 1] != b' '
+                        {
+                            ui.prompt_cursor -= 1;
+                        }
+                        ui.prompt_input.drain(ui.prompt_cursor..old_cursor);
+                    }
+                }
                 KeyCode::Backspace => {
                     if ui.prompt_cursor > 0 {
                         ui.prompt_cursor -= 1;
                         ui.prompt_input.remove(ui.prompt_cursor);
                     }
                 }
+                // Option+Left: jump word left
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                    while ui.prompt_cursor > 0
+                        && ui.prompt_input.as_bytes()[ui.prompt_cursor - 1] == b' '
+                    {
+                        ui.prompt_cursor -= 1;
+                    }
+                    while ui.prompt_cursor > 0
+                        && ui.prompt_input.as_bytes()[ui.prompt_cursor - 1] != b' '
+                    {
+                        ui.prompt_cursor -= 1;
+                    }
+                }
                 KeyCode::Left => {
                     ui.prompt_cursor = ui.prompt_cursor.saturating_sub(1);
+                }
+                // Option+Right: jump word right
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                    let len = ui.prompt_input.len();
+                    while ui.prompt_cursor < len
+                        && ui.prompt_input.as_bytes()[ui.prompt_cursor] != b' '
+                    {
+                        ui.prompt_cursor += 1;
+                    }
+                    while ui.prompt_cursor < len
+                        && ui.prompt_input.as_bytes()[ui.prompt_cursor] == b' '
+                    {
+                        ui.prompt_cursor += 1;
+                    }
                 }
                 KeyCode::Right => {
                     if ui.prompt_cursor < ui.prompt_input.len() {
@@ -318,6 +362,15 @@ impl TuiApp {
         };
 
         match state.phase {
+            OrchestraPhase::Init => {
+                let _ = self
+                    .action_tx
+                    .send(UserAction::SubmitTask {
+                        text: extracted.text,
+                        images,
+                    })
+                    .await;
+            }
             OrchestraPhase::PlanReview => {
                 let _ = self
                     .action_tx

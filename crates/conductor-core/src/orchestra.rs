@@ -354,6 +354,12 @@ impl Orchestra {
         // Auto-prune old sessions
         let _ = TaskStore::keep_recent(20).await;
 
+        // Interactive mode: wait for user to submit task via TUI
+        if self.config.task_description.is_empty() {
+            self.broadcast_state();
+            return Ok(());
+        }
+
         // Planning phase
         match self.do_plan().await {
             Ok(()) => {}
@@ -491,6 +497,15 @@ impl Orchestra {
                 if self.phase == OrchestraPhase::PlanReview {
                     if let Err(e) = self.replan(&text, images.as_deref()).await {
                         tracing::error!(error = %e, "replan failed");
+                    }
+                }
+            }
+            UserAction::SubmitTask { text, images: _ } => {
+                if self.phase == OrchestraPhase::Init {
+                    self.config.task_description = text;
+                    if let Err(e) = self.do_plan().await {
+                        tracing::error!(error = %e, "planning failed");
+                        self.set_phase(OrchestraPhase::Failed);
                     }
                 }
             }

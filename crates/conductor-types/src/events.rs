@@ -47,6 +47,10 @@ pub enum UserAction {
     FocusNext,
     FocusPrev,
     ToggleFocusView,
+    SubmitTask {
+        text: String,
+        images: Option<Vec<String>>,
+    },
     SubmitGuidance {
         text: String,
         images: Option<Vec<String>>,

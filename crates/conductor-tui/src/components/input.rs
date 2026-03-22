@@ -26,6 +26,7 @@ pub fn render_prompt_bar(
     phase: &OrchestraPhase,
 ) {
     let prefix = match phase {
+        OrchestraPhase::Init => "task",
         OrchestraPhase::PlanReview => "refine",
         OrchestraPhase::PhaseExecuting | OrchestraPhase::Executing => "guidance",
         _ => ">",
