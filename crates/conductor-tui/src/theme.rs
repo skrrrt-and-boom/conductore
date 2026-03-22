@@ -117,6 +117,31 @@ pub fn elapsed(ms: u64) -> String {
     }
 }
 
+/// Strip ANSI escape sequences and control characters from a string.
+/// Preserves newlines and tabs; removes everything else that could corrupt TUI rendering.
+pub fn strip_control_chars(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip ANSI escape sequence: ESC [ ... final_byte
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() || c2 == '~' {
+                        break;
+                    }
+                }
+            }
+        } else if c.is_control() && c != '\n' && c != '\t' {
+            // Skip control characters
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// Truncate a string to `max` chars, appending '…' if truncated.
 pub fn trunc(s: &str, max: usize) -> String {
     if s.chars().count() <= max {

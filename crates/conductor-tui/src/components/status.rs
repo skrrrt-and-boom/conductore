@@ -7,6 +7,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use conductor_types::{OrchestraPhase, OrchestraState};
 
@@ -49,7 +50,7 @@ pub fn render_status_line(f: &mut Frame, area: Rect, state: &OrchestraState) {
 
     // Build the line with spacing between left and right
     let left_len: usize = left.iter().map(|s| s.width()).sum();
-    let right_len = hint.len();
+    let right_len = UnicodeWidthStr::width(hint);
     let gap = (area.width as usize).saturating_sub(left_len + right_len + 1);
 
     left.push(Span::raw(" ".repeat(gap)));

@@ -29,7 +29,7 @@ cargo check -p conductor-core # Check a single crate
 
 - [ ] `cargo check --workspace` passes with zero errors
 - [ ] `cargo test --workspace` passes
-- [ ] `cargo build --release && cp target/release/conductor ~/.cargo/bin/conductor` to install updated binary
+- [ ] `cargo install --path crates/conductor-cli --force` to install updated binary
 - [ ] No `println!` in library crates — use `tracing` macros
 - [ ] New public items have doc comments
 

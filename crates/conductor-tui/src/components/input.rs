@@ -9,6 +9,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Row, Table},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use conductor_types::OrchestraPhase;
 
@@ -42,8 +43,11 @@ pub fn render_prompt_bar(
 
     f.render_widget(prompt, area);
 
-    // Show cursor position
-    let cursor_x = area.x + (prefix.len() + 3) as u16 + cursor_pos as u16;
+    // Show cursor position (use display width, not byte length)
+    let prefix_display = format!(" {prefix}> ");
+    let input_before_cursor = &input_text[..cursor_pos.min(input_text.len())];
+    let cursor_x = area.x + UnicodeWidthStr::width(prefix_display.as_str()) as u16
+        + UnicodeWidthStr::width(input_before_cursor) as u16;
     if cursor_x < area.x + area.width {
         f.set_cursor_position((cursor_x, area.y));
     }

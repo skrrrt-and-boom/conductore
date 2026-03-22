@@ -266,7 +266,7 @@ async fn clean_sessions(
             .context("failed to delete session")?;
         println!("Session {id} deleted.");
     } else {
-        println!("Usage: conductor clean --session <id> | --all | --older-than <days> | --keep <n>");
+        anyhow::bail!("No action specified. Usage: conductor clean --session <id> | --all | --older-than <days> | --keep <n>");
     }
     Ok(())
 }
@@ -313,25 +313,34 @@ async fn run_interactive(
     let tui_handle = tokio::spawn(async move { tui.run().await });
     let abort_handle = tui_handle.abort_handle();
 
-    tokio::select! {
+    let tui_error = tokio::select! {
         result = async {
             orchestra.run().await?;
             orchestra.event_loop().await
         } => {
             result.map_err(|e| anyhow::anyhow!("{e}"))?;
+            None
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl-C, shutting down");
+            None
         }
         tui_result = tui_handle => {
             // TUI exited (user pressed q or error)
-            if let Ok(Err(e)) = tui_result {
-                return Err(e);
+            match tui_result {
+                Ok(Err(e)) => Some(e),
+                _ => None,
             }
         }
-    }
+    };
 
+    // Ensure orchestra cleans up musician processes regardless of which branch fired
+    orchestra.shutdown().await;
     abort_handle.abort();
+
+    if let Some(e) = tui_error {
+        return Err(e);
+    }
     Ok(())
 }
 

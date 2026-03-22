@@ -9,3 +9,4 @@ tokio.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 anyhow.workspace = true
+unicode-width.workspace = true

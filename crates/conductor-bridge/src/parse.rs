@@ -2,7 +2,7 @@ use conductor_types::{ClaudeEvent, ClaudeEventType};
 use serde_json::Value;
 
 /// Helper to create a ClaudeEvent with all fields set to None.
-fn empty_event(event_type: ClaudeEventType) -> ClaudeEvent {
+pub fn empty_event(event_type: ClaudeEventType) -> ClaudeEvent {
     ClaudeEvent {
         event_type,
         subtype: None,
@@ -102,7 +102,9 @@ pub fn parse_claude_event(raw: &Value) -> Vec<ClaudeEvent> {
                 .and_then(|i| i.get("resetsAt"))
                 .and_then(|v| v.as_f64())
                 .map(|ts| {
-                    chrono::DateTime::from_timestamp(ts as i64, 0)
+                    let secs = ts as i64;
+                    let nanos = ((ts - secs as f64) * 1e9) as u32;
+                    chrono::DateTime::from_timestamp(secs, nanos)
                         .map(|dt| dt.to_rfc3339())
                         .unwrap_or_default()
                 });

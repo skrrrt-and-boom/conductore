@@ -54,6 +54,25 @@ pub fn render_musician_grid(
             render_musician_column(f, col_area, m, is_focused, layout, offset);
         }
     }
+
+    // Show indicator if any musicians couldn't be rendered
+    let hidden_count = musicians.len().saturating_sub(columns.len());
+    if hidden_count > 0 {
+        let badge = format!("+{hidden_count}");
+        let badge_w = badge.len() as u16 + 1;
+        if area.width >= badge_w {
+            let badge_area = Rect::new(
+                area.x + area.width - badge_w,
+                area.y,
+                badge_w,
+                1,
+            );
+            f.render_widget(
+                Paragraph::new(Span::styled(badge, Style::default().fg(C_DIM))),
+                badge_area,
+            );
+        }
+    }
 }
 
 /// Render a single musician column with bordered block, output lines, and stats.

@@ -79,8 +79,10 @@ impl ClaudeSession {
         // Spawn stderr collector task
         let stderr_tx = event_tx.clone();
         tokio::spawn(async move {
+            const MAX_STDERR_BUF: usize = 64 * 1024; // 64KB cap
             let mut stderr_buf = String::new();
             let mut reader = BufReader::new(stderr);
+            let mut io_error: Option<String> = None;
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line).await {
@@ -91,31 +93,41 @@ impl ClaudeSession {
                             tracing::debug!(stderr = trimmed, "claude stderr");
                             stderr_buf.push_str(trimmed);
                             stderr_buf.push('\n');
+                            // Cap buffer to prevent unbounded growth
+                            if stderr_buf.len() > MAX_STDERR_BUF {
+                                let excess = stderr_buf.len() - MAX_STDERR_BUF;
+                                let drain_to = stderr_buf[excess..]
+                                    .find('\n')
+                                    .map(|p| excess + p + 1)
+                                    .unwrap_or(excess);
+                                stderr_buf.drain(..drain_to);
+                            }
                         }
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "stderr read error");
+                        io_error = Some(e.to_string());
                         break;
                     }
                 }
             }
-            // If we collected stderr and it looks like a rate limit, emit an error event
-            if !stderr_buf.is_empty() && crate::parse::is_rate_limit_error(&stderr_buf) {
-                let ev = ClaudeEvent {
-                    event_type: ClaudeEventType::Error,
-                    subtype: Some("rate_limit".into()),
-                    message: Some(stderr_buf),
-                    session_id: None,
-                    tool_name: None,
-                    tool_input: None,
-                    tool_result_content: None,
-                    result: None,
-                    duration_ms: None,
-                    duration_api_ms: None,
-                    num_turns: None,
-                    is_error: None,
-                    resets_at: None,
+            // Emit error event for I/O errors
+            if let Some(err_msg) = io_error {
+                let mut ev = crate::parse::empty_event(ClaudeEventType::Error);
+                ev.subtype = Some("io_error".into());
+                ev.message = Some(format!("stderr reader failed: {err_msg}"));
+                let _ = stderr_tx.send(ev).await;
+            }
+            // Emit error event for all non-empty stderr, not just rate limits
+            if !stderr_buf.is_empty() {
+                let subtype = if crate::parse::is_rate_limit_error(&stderr_buf) {
+                    "rate_limit"
+                } else {
+                    "stderr"
                 };
+                let mut ev = crate::parse::empty_event(ClaudeEventType::Error);
+                ev.subtype = Some(subtype.into());
+                ev.message = Some(stderr_buf);
                 let _ = stderr_tx.send(ev).await;
             }
         });
@@ -124,23 +136,51 @@ impl ClaudeSession {
         tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let trimmed = line.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<serde_json::Value>(&trimmed) {
-                    Ok(raw) => {
-                        let events = crate::parse::parse_claude_event(&raw);
-                        for event in events {
-                            if event_tx.send(event).await.is_err() {
-                                // Receiver dropped — session is being torn down
-                                return;
+            let mut consecutive_parse_failures: u32 = 0;
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim().to_string();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<serde_json::Value>(&trimmed) {
+                            Ok(raw) => {
+                                consecutive_parse_failures = 0;
+                                let events = crate::parse::parse_claude_event(&raw);
+                                for event in events {
+                                    if event_tx.send(event).await.is_err() {
+                                        // Receiver dropped — session is being torn down
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                consecutive_parse_failures += 1;
+                                tracing::debug!(line = trimmed, error = %e, "non-JSON stdout line");
+                                if consecutive_parse_failures >= 3 {
+                                    let mut ev =
+                                        crate::parse::empty_event(ClaudeEventType::Error);
+                                    ev.subtype = Some("parse_error".into());
+                                    ev.message = Some(format!(
+                                        "{consecutive_parse_failures} consecutive JSON parse failures: {e}"
+                                    ));
+                                    if event_tx.send(ev).await.is_err() {
+                                        return;
+                                    }
+                                    consecutive_parse_failures = 0;
+                                }
                             }
                         }
                     }
+                    Ok(None) => break, // Clean EOF
                     Err(e) => {
-                        tracing::debug!(line = trimmed, error = %e, "non-JSON stdout line (progress indicator)");
+                        tracing::debug!(error = %e, "stdout I/O error");
+                        let mut ev = crate::parse::empty_event(ClaudeEventType::Error);
+                        ev.subtype = Some("io_error".into());
+                        ev.message = Some(format!("stdout reader failed: {e}"));
+                        let _ = event_tx.send(ev).await;
+                        break;
                     }
                 }
             }
@@ -176,10 +216,19 @@ impl ClaudeSession {
         // Drop stdin to send EOF to the child
         drop(self.stdin.take());
 
-        // Kill child if still running
+        // Kill child if still running, with timeout to prevent zombies
         if let Some(ref mut child) = self.child {
             let _ = child.start_kill();
-            let _ = child.wait().await;
+            match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "error waiting for child process");
+                }
+                Err(_) => {
+                    tracing::warn!("child process did not exit within 5s, forcing kill");
+                    let _ = child.kill().await;
+                }
+            }
         }
     }
 

@@ -123,6 +123,19 @@ impl TuiApp {
         loop {
             // Draw current state
             let state = self.state_rx.borrow().clone();
+
+            // Clamp indices when musician/task counts shrink
+            if !state.musicians.is_empty() {
+                ui.focused_panel = ui.focused_panel.min(state.musicians.len() - 1);
+            } else {
+                ui.focused_panel = 0;
+            }
+            if !state.tasks.is_empty() {
+                ui.plan_selected = ui.plan_selected.min(state.tasks.len() - 1);
+            } else {
+                ui.plan_selected = 0;
+            }
+
             terminal.draw(|f| render_all(f, &state, ui))?;
 
             // Check for terminal completion
@@ -468,10 +481,10 @@ fn word_left(cursor: &mut usize, input: &str) {
 fn word_right(cursor: &mut usize, input: &str) {
     let len = input.len();
     let bytes = input.as_bytes();
-    while *cursor < len && bytes[*cursor] != b' ' {
+    while *cursor < len && bytes.get(*cursor) != Some(&b' ') {
         *cursor += 1;
     }
-    while *cursor < len && bytes[*cursor] == b' ' {
+    while *cursor < len && bytes.get(*cursor) == Some(&b' ') {
         *cursor += 1;
     }
 }
@@ -481,10 +494,10 @@ fn word_delete_forward(cursor: &mut usize, input: &mut String) {
     let start = *cursor;
     let bytes = input.as_bytes();
     let mut end = start;
-    while end < len && bytes[end] != b' ' {
+    while end < len && bytes.get(end) != Some(&b' ') {
         end += 1;
     }
-    while end < len && bytes[end] == b' ' {
+    while end < len && bytes.get(end) == Some(&b' ') {
         end += 1;
     }
     input.drain(start..end);

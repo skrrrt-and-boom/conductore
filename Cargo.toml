@@ -27,6 +27,7 @@ clap = { version = "4", features = ["derive"] }
 # TUI
 ratatui = "0.30"
 crossterm = "0.28"
+unicode-width = "0.2"
 
 # Encoding
 base64 = "0.22"

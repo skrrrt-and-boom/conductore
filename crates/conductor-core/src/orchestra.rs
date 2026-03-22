@@ -138,7 +138,7 @@ pub struct Orchestra {
     tasks: Vec<Task>,
     phases: Vec<Phase>,
     current_phase_index: i32,
-    musicians: Vec<Musician>,
+    musicians: Vec<Option<Musician>>,
     musician_states: Vec<MusicianState>,
 
     // V2: Analysis
@@ -179,6 +179,10 @@ pub struct Orchestra {
     active_musicians: HashMap<String, tokio::task::JoinHandle<()>>,
     active_start_times: HashMap<String, std::time::Instant>,
 
+    // Musician return channel (spawned tasks send musicians back after execution)
+    musician_return_tx: mpsc::Sender<(usize, Musician)>,
+    musician_return_rx: Option<mpsc::Receiver<(usize, Musician)>>,
+
     // Phase-scoped task list (when executing within a phase)
     current_phase_tasks: Option<Vec<usize>>,
 
@@ -204,6 +208,7 @@ impl Orchestra {
         let initial_state = OrchestraState::new(config.clone());
         let (state_tx, state_rx) = watch::channel(initial_state.clone());
         let (event_tx, event_rx) = mpsc::channel::<OrchestraEvent>(256);
+        let (musician_return_tx, musician_return_rx) = mpsc::channel::<(usize, Musician)>(64);
         let (action_tx, action_rx) = mpsc::channel::<UserAction>(64);
 
         let task_store = TaskStore::new(&config.session_id);
@@ -260,6 +265,8 @@ impl Orchestra {
             phase_before_pause: OrchestraPhase::Init,
             active_musicians: HashMap::new(),
             active_start_times: HashMap::new(),
+            musician_return_tx,
+            musician_return_rx: Some(musician_return_rx),
             current_phase_tasks: None,
             event_tx,
             event_rx: Some(event_rx),
@@ -467,7 +474,7 @@ impl Orchestra {
                     tracing::warn!(musician = %musician_id, "rate limit detected");
                     self.phase_before_pause = self.phase.clone();
                     self.set_phase(OrchestraPhase::Paused);
-                    for musician in &mut self.musicians {
+                    for musician in self.musicians.iter_mut().filter_map(|m| m.as_mut()) {
                         musician.pause();
                     }
                 }
@@ -478,6 +485,15 @@ impl Orchestra {
             } => {
                 self.active_musicians.remove(&musician_id);
                 self.active_start_times.remove(&musician_id);
+
+                // Store result in the matching task
+                if let Some(ms) = self.musician_states.iter().find(|m| m.id == musician_id) {
+                    if let Some(ref task) = ms.current_task {
+                        if let Some(t) = self.tasks.iter_mut().find(|t| t.index == task.index) {
+                            t.result = Some(result.clone());
+                        }
+                    }
+                }
 
                 tracing::info!(
                     musician = %musician_id,
@@ -514,6 +530,7 @@ impl Orchestra {
                 if self.phase == OrchestraPhase::PlanReview {
                     if let Err(e) = self.replan(&text, images.as_deref()).await {
                         tracing::error!(error = %e, "replan failed");
+                        self.set_phase(OrchestraPhase::PlanReview);
                     }
                 }
             }
@@ -530,7 +547,7 @@ impl Orchestra {
                 self.queue_guidance(&text).await;
                 // If images were attached to guidance, inject them to interactive musicians
                 if let Some(ref imgs) = images {
-                    for musician in &mut self.musicians {
+                    for musician in self.musicians.iter_mut().filter_map(|m| m.as_mut()) {
                         if musician.is_interactive() {
                             let _ = musician.inject_prompt_with_images(&text, Some(imgs)).await;
                         }
@@ -539,6 +556,15 @@ impl Orchestra {
             }
             _ => {
                 // FocusNext, FocusPrev, Scroll, Resize, etc. — TUI handles these locally
+            }
+        }
+    }
+
+    /// Restore musicians returned from completed spawned tasks.
+    fn drain_musician_returns(&mut self) {
+        if let Some(ref mut rx) = self.musician_return_rx {
+            while let Ok((idx, musician)) = rx.try_recv() {
+                self.musicians[idx] = Some(musician);
             }
         }
     }
@@ -554,11 +580,19 @@ impl Orchestra {
             }
         }
         for id in stuck_ids {
-            if let Some(m) = self.musicians.iter_mut().find(|m| m.get_state().id == id) {
-                m.reset();
-                tracing::warn!(musician = %id, "force-cleaned stuck musician");
+            if let Some(slot) = self.musicians.iter_mut().find(|m| {
+                m.as_ref().map(|x| x.get_state().id == id).unwrap_or(false)
+            }) {
+                if let Some(m) = slot.as_mut() {
+                    m.reset();
+                }
             }
             self.active_start_times.remove(&id);
+            // Also remove from active_musicians and abort the handle
+            if let Some(handle) = self.active_musicians.remove(&id) {
+                handle.abort();
+                tracing::warn!(musician = %id, "aborted stuck musician handle");
+            }
         }
 
         // Sync shared memory to running musicians
@@ -891,12 +925,20 @@ impl Orchestra {
         let feedback_owned = feedback.to_string();
         let images_owned = images.map(|i| i.to_vec());
 
-        let (plan, explanation) = self.run_conductor_op(move |mut conductor| {
+        let result = self.run_conductor_op(move |mut conductor| {
             Box::pin(async move {
                 let result = conductor.refine_plan(&feedback_owned, images_owned.as_deref()).await;
                 (conductor, result)
             })
-        }).await?;
+        }).await;
+
+        let (plan, explanation) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.set_phase(OrchestraPhase::PlanReview);
+                return Err(e);
+            }
+        };
 
         self.refinement_history.push(PlanRefinementMessage {
             role: RefinementRole::Conductor,
@@ -955,7 +997,7 @@ impl Orchestra {
                 self.config.max_turns,
             );
             self.musician_states.push(musician.get_state());
-            self.musicians.push(musician);
+            self.musicians.push(Some(musician));
         }
     }
 
@@ -971,10 +1013,10 @@ impl Orchestra {
             }
 
             // Find idle musicians and assign tasks
-            let idle_indices: Vec<usize> = self.musicians.iter().enumerate()
-                .filter(|(_, m)| {
-                    let status = m.get_state().status;
-                    status == MusicianStatus::Idle || status == MusicianStatus::Completed
+            let idle_indices: Vec<usize> = self.musician_states.iter().enumerate()
+                .filter(|(idx, ms)| {
+                    (ms.status == MusicianStatus::Idle || ms.status == MusicianStatus::Completed)
+                        && self.musicians.get(*idx).map(|m| m.is_some()).unwrap_or(false)
                 })
                 .map(|(idx, _)| idx)
                 .collect();
@@ -1010,7 +1052,7 @@ impl Orchestra {
 
             for (idx, mut task) in assignments {
                 task.status = TaskStatus::InProgress;
-                task.assigned_musician = Some(self.musicians[idx].get_state().id.clone());
+                task.assigned_musician = Some(self.musicians[idx].as_ref().unwrap().get_state().id.clone());
 
                 // Update task in our list
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.index == task.index) {
@@ -1027,7 +1069,7 @@ impl Orchestra {
                 let slug = &slug[..slug.len().min(30)];
 
                 let (worktree_path, branch) = if use_worktrees {
-                    let musician_id = self.musicians[idx].get_state().id.clone();
+                    let musician_id = self.musicians[idx].as_ref().unwrap().get_state().id.clone();
                     match self.worktree_manager.create(&musician_id, slug).await {
                         Ok((path, branch)) => (path.to_string_lossy().to_string(), branch),
                         Err(e) => {
@@ -1041,13 +1083,13 @@ impl Orchestra {
 
                 // Smart model routing
                 if let Some(ref model) = task.model {
-                    self.musicians[idx].set_model_override(model);
+                    self.musicians[idx].as_mut().unwrap().set_model_override(model);
                 }
 
                 // Track worktree snapshot
                 if use_worktrees {
                     self.worktree_snapshots.push(WorktreeSnapshot {
-                        worker_id: self.musicians[idx].get_state().id.clone(),
+                        worker_id: self.musicians[idx].as_ref().unwrap().get_state().id.clone(),
                         task_index: task.index,
                         branch: branch.clone(),
                         path: worktree_path.clone(),
@@ -1061,19 +1103,20 @@ impl Orchestra {
 
                 // Generate assignment insight
                 self.insight_generator
-                    .on_task_assigned(&self.musicians[idx].get_state().id, &task);
+                    .on_task_assigned(&self.musicians[idx].as_ref().unwrap().get_state().id, &task);
 
                 let event_tx = self.event_tx.clone();
                 let project_path = self.config.project_path.clone();
-                let musician_id = self.musicians[idx].get_state().id.clone();
+                let musician_id = self.musicians[idx].as_ref().unwrap().get_state().id.clone();
                 let task_clone = task.clone();
                 let wt_path = worktree_path.clone();
                 let br = branch.clone();
 
-                // We need to move the musician out temporarily for the spawned task.
-                // Since we can't move it out of the Vec, we swap with a placeholder.
-                let mut musician = Musician::new("temp".into(), 0, "temp".into(), 0);
-                std::mem::swap(&mut self.musicians[idx], &mut musician);
+                // Take the musician out of the Vec for the spawned task.
+                // It will be returned via musician_return_tx after execution.
+                let mut musician = self.musicians[idx].take()
+                    .expect("musician should be present when assigned");
+                let return_tx = self.musician_return_tx.clone();
 
                 let handle = tokio::spawn(async move {
                     let result = musician
@@ -1089,6 +1132,8 @@ impl Orchestra {
                         .await;
                     // Result is already sent via MusicianComplete event in execute()
                     let _ = result;
+                    // Return musician to orchestra
+                    let _ = return_tx.send((idx, musician)).await;
                 });
 
                 self.active_musicians.insert(musician_id.clone(), handle);
@@ -1106,6 +1151,7 @@ impl Orchestra {
                     self.handle_event(event).await;
                 }
             }
+            self.drain_musician_returns();
             self.broadcast_state();
 
             // Wait for at least one musician to finish
@@ -1121,7 +1167,9 @@ impl Orchestra {
                     if !completed.is_empty() {
                         for id in completed {
                             if let Some(handle) = self.active_musicians.remove(&id) {
-                                let _ = handle.await;
+                                if let Err(e) = handle.await {
+                                    tracing::error!(musician = %id, error = %e, "musician task panicked");
+                                }
                             }
                         }
                         break;
@@ -1136,6 +1184,7 @@ impl Orchestra {
                             self.handle_event(event).await;
                         }
                     }
+                    self.drain_musician_returns();
                     self.broadcast_state();
                 }
             }
@@ -1145,13 +1194,15 @@ impl Orchestra {
         }
 
         // Wait for all remaining musicians
-        let handles: Vec<_> = self.active_musicians.drain().map(|(_, h)| h).collect();
-        for handle in handles {
-            let _ = handle.await;
+        let handles: Vec<_> = self.active_musicians.drain().map(|(id, h)| (id, h)).collect();
+        for (id, handle) in handles {
+            if let Err(e) = handle.await {
+                tracing::error!(musician = %id, error = %e, "musician task panicked");
+            }
         }
         self.active_start_times.clear();
 
-        // Drain final events
+        // Drain final events and returned musicians
         {
             let events: Vec<_> = self.event_rx.as_mut()
                 .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
@@ -1160,6 +1211,7 @@ impl Orchestra {
                 self.handle_event(event).await;
             }
         }
+        self.drain_musician_returns();
         self.sync_task_results().await;
 
         Ok(())
@@ -1703,7 +1755,7 @@ impl Orchestra {
                 "[MEMORY UPDATE from other musicians]:\n{}",
                 &content[..content.len().min(2000)]
             );
-            for musician in &mut self.musicians {
+            for musician in self.musicians.iter_mut().filter_map(|m| m.as_mut()) {
                 if musician.is_interactive() {
                     let _ = musician.inject_prompt(&msg).await;
                 }
@@ -1946,7 +1998,7 @@ impl Orchestra {
 
     /// Send a message to a specific musician's active session.
     pub async fn chat_with_musician(&mut self, musician_id: &str, message: &str) -> bool {
-        if let Some(m) = self.musicians.iter_mut().find(|m| m.get_state().id == musician_id) {
+        if let Some(m) = self.musicians.iter_mut().filter_map(|m| m.as_mut()).find(|m| m.get_state().id == musician_id) {
             m.inject_prompt(message).await
         } else {
             false
@@ -1957,6 +2009,7 @@ impl Orchestra {
     pub fn get_interactive_musicians(&self) -> Vec<String> {
         self.musicians
             .iter()
+            .filter_map(|m| m.as_ref())
             .filter(|m| m.is_interactive())
             .map(|m| m.get_state().id.clone())
             .collect()
@@ -2008,8 +2061,8 @@ mod tests {
         orchestra.ensure_musicians(3);
         assert_eq!(orchestra.musicians.len(), 3);
         assert_eq!(orchestra.musician_states.len(), 3);
-        assert_eq!(orchestra.musicians[0].get_state().id, "m1");
-        assert_eq!(orchestra.musicians[2].get_state().id, "m3");
+        assert_eq!(orchestra.musicians[0].as_ref().unwrap().get_state().id, "m1");
+        assert_eq!(orchestra.musicians[2].as_ref().unwrap().get_state().id, "m3");
     }
 
     #[test]

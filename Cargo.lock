@@ -318,6 +318,7 @@ dependencies = [
  "crossterm 0.28.1",
  "ratatui",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

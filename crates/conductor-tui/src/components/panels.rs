@@ -60,9 +60,10 @@ pub fn render_plan_review(
 
     // Summary
     if let Some(plan) = plan {
+        let clean_summary = theme::strip_control_chars(&plan.summary);
         let summary = Paragraph::new(vec![
             Line::from(Span::styled(
-                theme::trunc(&plan.summary, inner.width as usize),
+                theme::trunc(&clean_summary, inner.width as usize),
                 Style::default().fg(C_TEXT),
             )),
             Line::from(Span::styled(
@@ -117,7 +118,7 @@ pub fn render_plan_review(
                 Span::styled(indicator, sel_style),
                 Span::styled(format!(" {} ", viz.dot), Style::default().fg(viz.color)),
                 Span::styled(
-                    format!("{}. {}", task.index + 1, theme::trunc(&task.title, (inner.width as usize).saturating_sub(10))),
+                    format!("{}. {}", task.index + 1, theme::trunc(&theme::strip_control_chars(&task.title), (inner.width as usize).saturating_sub(10))),
                     sel_style,
                 ),
             ]);
@@ -263,7 +264,8 @@ pub fn render_task_detail(
 
     // Description
     lines.push(Line::from(Span::styled("DESCRIPTION", Style::default().fg(C_DIM))));
-    for line in task.description.lines() {
+    let clean_desc = theme::strip_control_chars(&task.description);
+    for line in clean_desc.lines() {
         lines.push(Line::from(Span::styled(line, Style::default().fg(C_TEXT))));
     }
     lines.push(Line::raw(""));
