@@ -44,6 +44,17 @@ impl Tab {
         }
     }
 
+    /// Icon for narrow terminals (shown instead of label when width < NARROW).
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Tab::Orchestra => "\u{266b}",  // musical note
+            Tab::Plan      => "\u{1f4cb}", // clipboard
+            Tab::Stats     => "\u{1f4ca}", // chart
+            Tab::Diff      => "\u{1f4c4}", // page
+            Tab::Log       => "\u{1f4dd}", // memo
+        }
+    }
+
     /// Shortcut key shown in tab bar (1-5).
     pub fn key(&self) -> char {
         match self {
@@ -374,8 +385,9 @@ pub struct LogTabState {
     pub log_filter: Option<String>,
     /// Auto-scroll to bottom when new entries arrive.
     pub auto_scroll: bool,
-    /// Filter by event source (None = all).
-    pub source_filter: Option<LogSource>,
+    /// Filter by event source (None = all, Some(index) = musician at that index,
+    /// usize::MAX = conductor-only). Matches LogEntrySource for filtering.
+    pub source_filter: Option<LogSourceFilter>,
 }
 
 impl Default for LogTabState {
@@ -389,11 +401,25 @@ impl Default for LogTabState {
     }
 }
 
+/// Filter for log source. Kept in TUI layer (not in conductor-types)
+/// because it's purely a UI concern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogSource {
+pub enum LogSourceFilter {
     Conductor,
-    Musician(usize), // musician index
+    Musician(usize), // musician index -- matches LogEntrySource::Musician.index
     System,
+}
+
+impl LogSourceFilter {
+    /// Check if a LogEntrySource matches this filter.
+    pub fn matches(&self, source: &LogEntrySource) -> bool {
+        match (self, source) {
+            (LogSourceFilter::Conductor, LogEntrySource::Conductor) => true,
+            (LogSourceFilter::Musician(idx), LogEntrySource::Musician { index, .. }) => idx == index,
+            (LogSourceFilter::System, LogEntrySource::System) => true,
+            _ => false,
+        }
+    }
 }
 ```
 
@@ -493,15 +519,29 @@ pub struct OrchestraState {
 pub struct OrchestraStats {
     /// Per-musician token and cost breakdown.
     pub musician_stats: Vec<MusicianStats>,
+    /// Conductor agent's own token usage (planning, reviewing, guidance).
+    /// The conductor typically uses opus and accounts for the largest share of cost.
+    pub conductor_stats: ConductorStats,
     /// Per-phase cost breakdown.
     pub phase_costs: Vec<PhaseCost>,
-    /// Total tokens (input + output) across all musicians.
+    /// Total tokens (input + output) across ALL agents (conductor + musicians).
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
-    /// Total estimated cost in USD.
+    /// Total estimated cost in USD (conductor + musicians).
     pub total_cost_usd: f64,
     /// Model usage breakdown (model_id -> token count).
     pub model_usage: Vec<ModelUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ConductorStats {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+    /// Number of LLM calls made by the conductor agent.
+    pub calls: u32,
+    /// Per-call token counts for sparkline rendering.
+    pub token_history: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -542,9 +582,12 @@ pub struct ModelUsage {
 |-------|------------|------------|
 | `MusicianStats.input_tokens` / `output_tokens` | `conductor-core/src/orchestra.rs` | Parsed from `ClaudeEvent` `duration_api_ms`, `num_turns` fields; future: parse usage from Claude NDJSON stream |
 | `MusicianStats.cost_usd` | `conductor-core/src/orchestra.rs` | Calculated from token counts x model pricing table |
-| `PhaseCost` | `conductor-core/src/orchestra.rs` | Aggregated from `MusicianStats` grouped by `current_phase_index` |
-| `ModelUsage` | `conductor-core/src/orchestra.rs` | Aggregated from `MusicianStats` grouped by `config.musician_model` |
+| `ConductorStats.*` | `conductor-core/src/conductor_agent.rs` | Accumulated from each conductor LLM call (planning, decomposing, reviewing, guidance) |
+| `PhaseCost` | `conductor-core/src/orchestra.rs` | Aggregated from `MusicianStats` + `ConductorStats` grouped by `current_phase_index` |
+| `ModelUsage` | `conductor-core/src/orchestra.rs` | Aggregated by model: conductor uses `config.conductor_model` (typically opus), musicians use `config.musician_model` (typically sonnet) |
 | `token_history` | `conductor-core/src/musician.rs` | Append on each `ClaudeEvent::Result` |
+
+**Note on conductor cost dominance:** The conductor agent typically uses an expensive model (opus) for planning, reviewing, and guidance. In production runs, conductor cost often exceeds total musician cost (the Stats tab mockup shows Conductor at $1.84 vs all musicians combined at $0.72). Tracking conductor stats separately is essential for cost optimization insights.
 
 ### 3.2 Diff Tab Data
 
@@ -754,9 +797,10 @@ render_all(f, state, ui)
 |   |
 |   |-- [Tab::Stats] render_stats_tab(f, area, state, &ui.tab_state.stats)  [NEW]
 |   |   |-- stats::render_cost_summary(f, area, stats)
-|   |   |-- stats::render_musician_gauges(f, area, stats)
-|   |   |-- stats::render_phase_breakdown(f, area, stats)
-|   |   +-- stats::render_model_usage(f, area, stats)
+|   |   |-- stats::render_conductor_gauge(f, area, conductor_stats)
+|   |   |-- stats::render_musician_gauges(f, area, musician_stats)
+|   |   |-- stats::render_phase_breakdown(f, area, phase_costs)
+|   |   +-- stats::render_model_usage(f, area, model_usage)
 |   |
 |   |-- [Tab::Diff] render_diff_tab(f, area, state, &ui.tab_state.diff)     [NEW]
 |   |   |-- diff::render_file_list(f, area, diffs, expanded, selected, musician_filter)
@@ -858,9 +902,11 @@ use ratatui::{
 };
 use conductor_types::OrchestraPhase;
 use crate::app::Tab;
+use crate::layout::NARROW;
 
 /// Render the tab bar. Active tab is highlighted, invisible tabs are dimmed/hidden.
 pub fn render_tab_bar(f: &mut Frame, area: Rect, active_tab: Tab, phase: &OrchestraPhase) {
+    let narrow = area.width < NARROW;
     let mut spans = Vec::new();
 
     for (i, tab) in Tab::ALL.iter().enumerate() {
@@ -877,7 +923,13 @@ pub fn render_tab_bar(f: &mut Frame, area: Rect, active_tab: Tab, phase: &Orches
             continue;
         }
 
-        let label = format!(" {} {} ", tab.key(), tab.label());
+        // Use icon-only labels on narrow terminals
+        let label = if narrow {
+            format!(" {} {} ", tab.key(), tab.icon())
+        } else {
+            format!(" {} {} ", tab.key(), tab.label())
+        };
+
         if *tab == active_tab {
             spans.push(Span::styled(
                 label,
@@ -1086,17 +1138,41 @@ fn is_navigation_key(key: &KeyEvent, active_tab: Tab) -> bool {
 
 ---
 
-## 6. Implementation Order
+## 6. Edge Cases & Design Decisions
+
+### 6.1 Terminal Resize During Tab Switch
+
+When the terminal resizes, `layout_config` is recomputed (unchanged from current behavior). Tab-specific state (scroll offsets, selections) is not affected by resize -- the render functions clamp any out-of-bounds values at render time.
+
+### 6.2 Event Log Growth
+
+`event_log` grows unboundedly during long sessions. **Mitigation:** Cap at 10,000 entries in `orchestra.rs`, dropping oldest entries. The Log tab should show a "truncated" indicator when the cap is hit.
+
+### 6.3 Diff Data Availability
+
+`aggregated_diffs` is populated during merge phases. If the user switches to the Diff tab before any merges, show an empty state: "No changes merged yet." The tab is only *visible* after `PhaseMerging` starts (see Section 1.2).
+
+### 6.4 Stats Data Availability
+
+`stats` starts as `None`. The Stats tab renders "Waiting for execution data..." when `None`. Stats are populated as soon as the first musician completes a turn (via `ClaudeEvent::Result`).
+
+### 6.5 Plan Tab After Execution Starts
+
+The Plan tab remains accessible during and after execution. It shows the approved plan as read-only (task statuses update live). The refinement chat is only interactive during `PlanReview` phase; in other phases, it displays the history read-only.
+
+---
+
+## 7. Implementation Order
 
 1. **Add `Tab` enum + `TabState` to `app.rs`** -- Pure additions, no behavior change yet
-2. **Add new types to `conductor-types/src/state.rs`** -- `OrchestraStats`, `FileDiff`, `LogEntry` + fields on `OrchestraState`
+2. **Add new types to `conductor-types/src/state.rs`** -- `OrchestraStats`, `ConductorStats`, `FileDiff`, `LogEntry` + fields on `OrchestraState`
 3. **Refactor `render_all()` -> tab dispatch** -- Insert `render_tab_bar`, replace `render_content` with `render_tab_content`
 4. **Migrate scroll/selection state** -- Move fields from flat `UiState` into `TabState` sub-structs
 5. **Add tab switching key bindings** -- `1-5` keys, auto-switch on phase transitions
 6. **Implement Stats tab renderer** -- New `components/stats.rs`
 7. **Implement Diff tab renderer** -- New `components/diff.rs`
 8. **Implement Log tab renderer** -- New `components/log.rs`
-9. **Wire up stats computation** in `conductor-core/src/orchestra.rs`
+9. **Wire up stats computation** in `conductor-core/src/orchestra.rs` and `conductor-core/src/conductor_agent.rs`
 10. **Wire up diff aggregation** in `conductor-core/src/orchestra.rs`
 11. **Wire up event log** in `conductor-core/src/orchestra.rs`
 
