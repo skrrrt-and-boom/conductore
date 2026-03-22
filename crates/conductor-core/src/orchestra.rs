@@ -487,15 +487,23 @@ impl Orchestra {
                     }
                 }
             }
-            UserAction::RefinePlan(feedback) => {
+            UserAction::RefinePlan { text, images } => {
                 if self.phase == OrchestraPhase::PlanReview {
-                    if let Err(e) = self.replan(&feedback).await {
+                    if let Err(e) = self.replan(&text, images.as_deref()).await {
                         tracing::error!(error = %e, "replan failed");
                     }
                 }
             }
-            UserAction::SubmitGuidance(message) => {
-                self.queue_guidance(&message).await;
+            UserAction::SubmitGuidance { text, images } => {
+                self.queue_guidance(&text).await;
+                // If images were attached to guidance, inject them to interactive musicians
+                if let Some(ref imgs) = images {
+                    for musician in &mut self.musicians {
+                        if musician.is_interactive() {
+                            let _ = musician.inject_prompt_with_images(&text, Some(imgs)).await;
+                        }
+                    }
+                }
             }
             _ => {
                 // FocusNext, FocusPrev, Scroll, Resize, etc. — TUI handles these locally
@@ -826,7 +834,11 @@ impl Orchestra {
 
     // ─── Plan Refinement ───────────────────────────────────────
 
-    async fn replan(&mut self, feedback: &str) -> Result<(), CoreError> {
+    async fn replan(
+        &mut self,
+        feedback: &str,
+        images: Option<&[String]>,
+    ) -> Result<(), CoreError> {
         if self.phase != OrchestraPhase::PlanReview || self.plan.is_none() {
             return Ok(());
         }
@@ -834,7 +846,7 @@ impl Orchestra {
         self.refinement_history.push(PlanRefinementMessage {
             role: RefinementRole::User,
             text: feedback.to_string(),
-            images: None,
+            images: images.map(|i| i.to_vec()),
             timestamp: chrono::Utc::now().to_rfc3339(),
         });
 
@@ -842,7 +854,7 @@ impl Orchestra {
         self.conductor_output.clear();
 
         let cb = self.make_callbacks();
-        let (plan, explanation) = self.conductor.refine_plan(feedback, &cb).await?;
+        let (plan, explanation) = self.conductor.refine_plan(feedback, images, &cb).await?;
 
         self.refinement_history.push(PlanRefinementMessage {
             role: RefinementRole::Conductor,

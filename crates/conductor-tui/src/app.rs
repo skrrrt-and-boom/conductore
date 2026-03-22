@@ -14,7 +14,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use conductor_types::{OrchestraPhase, OrchestraState, SessionData, UserAction};
+use conductor_types::{extract_image_paths, OrchestraPhase, OrchestraState, SessionData, UserAction};
 
 use crate::{
     components::{header, input, insights, musician, panels, status},
@@ -310,12 +310,31 @@ impl TuiApp {
     }
 
     async fn submit_input(&self, text: &str, state: &OrchestraState) {
+        let extracted = extract_image_paths(text);
+        let images = if extracted.images.is_empty() {
+            None
+        } else {
+            Some(extracted.images)
+        };
+
         match state.phase {
             OrchestraPhase::PlanReview => {
-                let _ = self.action_tx.send(UserAction::RefinePlan(text.to_string())).await;
+                let _ = self
+                    .action_tx
+                    .send(UserAction::RefinePlan {
+                        text: extracted.text,
+                        images,
+                    })
+                    .await;
             }
             _ => {
-                let _ = self.action_tx.send(UserAction::SubmitGuidance(text.to_string())).await;
+                let _ = self
+                    .action_tx
+                    .send(UserAction::SubmitGuidance {
+                        text: extracted.text,
+                        images,
+                    })
+                    .await;
             }
         }
     }

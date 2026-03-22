@@ -264,14 +264,18 @@ impl ConductorAgent {
     }
 
     /// Chat-based plan refinement — sends feedback to the same session.
+    /// Optionally includes image attachments (drag-and-drop screenshots, mockups, etc.).
     pub async fn refine_plan(
         &mut self,
         feedback: &str,
+        images: Option<&[String]>,
         callbacks: &ConductorCallbacks,
     ) -> Result<(Plan, String), CoreError> {
         self.ensure_session()?;
         let message = format!("{REFINE_PROMPT}\n\nUser feedback: {feedback}");
-        let full_output = self.send_and_collect(&message, callbacks).await?;
+        let full_output = self
+            .send_and_collect_with_images(&message, images, callbacks)
+            .await?;
 
         let json_start = full_output.find("```json");
         let explanation = match json_start {
@@ -404,6 +408,17 @@ impl ConductorAgent {
         message: &str,
         callbacks: &ConductorCallbacks,
     ) -> Result<String, CoreError> {
+        self.send_and_collect_with_images(message, None, callbacks)
+            .await
+    }
+
+    /// Send a message with optional image attachments and collect output.
+    async fn send_and_collect_with_images(
+        &mut self,
+        message: &str,
+        images: Option<&[String]>,
+        callbacks: &ConductorCallbacks,
+    ) -> Result<String, CoreError> {
         self.prompts_sent.push(message.to_string());
 
         let session = self
@@ -422,9 +437,9 @@ impl ConductorAgent {
                 .map_err(|e| CoreError::Bridge(e.to_string()))?;
             self.event_rx = Some(event_rx);
         } else {
-            // Follow-up message
+            // Follow-up message (with optional images)
             session
-                .send_message(message)
+                .send_message_with_images(message, images)
                 .await
                 .map_err(|e| CoreError::Bridge(e.to_string()))?;
         }

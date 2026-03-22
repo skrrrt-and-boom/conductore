@@ -1,5 +1,7 @@
 use crate::BridgeError;
+use base64::Engine;
 use conductor_types::{ClaudeEvent, ClaudeEventType};
+use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -72,7 +74,7 @@ impl ClaudeSession {
         self.child = Some(child);
 
         // Write initial message
-        self.write_message(initial_prompt).await?;
+        self.write_message(initial_prompt, None).await?;
 
         // Spawn stderr collector task
         let stderr_tx = event_tx.clone();
@@ -152,10 +154,19 @@ impl ClaudeSession {
 
     /// Send a follow-up message to the running session.
     pub async fn send_message(&mut self, text: &str) -> Result<(), BridgeError> {
+        self.send_message_with_images(text, None).await
+    }
+
+    /// Send a follow-up message with optional image attachments.
+    pub async fn send_message_with_images(
+        &mut self,
+        text: &str,
+        images: Option<&[String]>,
+    ) -> Result<(), BridgeError> {
         if self.closed || self.stdin.is_none() {
             return Err(BridgeError::SessionClosed);
         }
-        self.write_message(text).await
+        self.write_message(text, images).await
     }
 
     /// Gracefully close the session.
@@ -176,17 +187,47 @@ impl ClaudeSession {
     }
 
     /// Write a user message to stdin in stream-json format.
-    async fn write_message(&mut self, text: &str) -> Result<(), BridgeError> {
+    /// Optionally includes base64-encoded image content blocks.
+    async fn write_message(
+        &mut self,
+        text: &str,
+        images: Option<&[String]>,
+    ) -> Result<(), BridgeError> {
         let stdin = match self.stdin.as_mut() {
             Some(s) => s,
             None => return Err(BridgeError::SessionClosed),
         };
 
+        let mut content = vec![serde_json::json!({"type": "text", "text": text})];
+
+        // Add images as base64 content blocks
+        if let Some(image_paths) = images {
+            for img_path in image_paths {
+                match tokio::fs::read(img_path).await {
+                    Ok(data) => {
+                        let media_type = mime_type_from_path(img_path);
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                        content.push(serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64,
+                            }
+                        }));
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = img_path, error = %e, "could not read image, skipping");
+                    }
+                }
+            }
+        }
+
         let msg = serde_json::json!({
             "type": "user",
             "message": {
                 "role": "user",
-                "content": [{"type": "text", "text": text}]
+                "content": content,
             }
         });
 
@@ -195,6 +236,25 @@ impl ClaudeSession {
         stdin.write_all(&bytes).await?;
         stdin.flush().await?;
         Ok(())
+    }
+}
+
+/// Determine MIME type from file extension.
+fn mime_type_from_path(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("tif" | "tiff") => "image/tiff",
+        _ => "image/png", // fallback
     }
 }
 

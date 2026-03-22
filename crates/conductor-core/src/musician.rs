@@ -158,12 +158,21 @@ impl Musician {
     ///
     /// Returns true if the message was sent, false if no session is active.
     pub async fn inject_prompt(&mut self, text: &str) -> bool {
+        self.inject_prompt_with_images(text, None).await
+    }
+
+    /// Inject a prompt with optional image attachments.
+    pub async fn inject_prompt_with_images(
+        &mut self,
+        text: &str,
+        images: Option<&[String]>,
+    ) -> bool {
         let session = match self.session.as_mut() {
             Some(s) if !s.is_closed() => s,
             _ => return false,
         };
 
-        if session.send_message(text).await.is_err() {
+        if session.send_message_with_images(text, images).await.is_err() {
             return false;
         }
 
@@ -172,7 +181,11 @@ impl Musician {
         } else {
             ""
         };
-        let label = format!("[USER] {status_note}{text}");
+        let img_note = match images {
+            Some(imgs) if !imgs.is_empty() => format!(" [+{} image(s)]", imgs.len()),
+            _ => String::new(),
+        };
+        let label = format!("[USER] {status_note}{text}{img_note}");
         self.push_output(&label);
         true
     }

@@ -47,10 +47,16 @@ pub enum UserAction {
     FocusNext,
     FocusPrev,
     ToggleFocusView,
-    SubmitGuidance(String),
+    SubmitGuidance {
+        text: String,
+        images: Option<Vec<String>>,
+    },
     ApprovePlan,
     RejectPlan(String),
-    RefinePlan(String),
+    RefinePlan {
+        text: String,
+        images: Option<Vec<String>>,
+    },
     Resize { width: u16, height: u16 },
     ScrollUp,
     ScrollDown,
