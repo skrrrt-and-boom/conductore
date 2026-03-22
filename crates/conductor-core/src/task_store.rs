@@ -383,6 +383,7 @@ mod tests {
                 session_id: "test-save-load".into(),
                 reference_session_id: None,
                 verification: None,
+                headless: false,
             },
             phase: conductor_types::OrchestraPhase::Init,
             started_at: "2026-01-01T00:00:00Z".into(),

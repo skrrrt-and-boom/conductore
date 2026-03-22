@@ -300,6 +300,7 @@ async fn run_interactive(
         session_id: session_id.to_string(),
         reference_session_id: None,
         verification: None,
+        headless: false,
     };
 
     info!(session_id = %session_id, "Starting interactive session");
@@ -365,6 +366,7 @@ async fn run_headless(
         session_id: session_id.to_string(),
         reference_session_id,
         verification: None,
+        headless: true,
     };
 
     info!(session_id = %session_id, "Starting headless session");

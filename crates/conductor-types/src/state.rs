@@ -45,6 +45,9 @@ pub struct OrchestraConfig {
     pub session_id: String,
     pub reference_session_id: Option<String>,
     pub verification: Option<Vec<String>>,
+    /// When true, the orchestra auto-approves the plan without waiting for user input.
+    #[serde(default)]
+    pub headless: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -563,6 +566,7 @@ mod tests {
             session_id: "sess-001".into(),
             reference_session_id: None,
             verification: None,
+            headless: false,
         }
     }
 

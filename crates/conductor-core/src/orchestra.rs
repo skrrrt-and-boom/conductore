@@ -722,6 +722,14 @@ impl Orchestra {
         }
 
         self.set_phase(OrchestraPhase::PlanReview);
+
+        // In headless mode, auto-approve the plan and start execution immediately
+        // instead of waiting for a UserAction::ApprovePlan that will never come.
+        if self.config.headless {
+            tracing::info!("headless mode: auto-approving plan");
+            self.start_execution().await?;
+        }
+
         Ok(())
     }
 
@@ -1971,6 +1979,7 @@ mod tests {
             session_id: "test-session".into(),
             reference_session_id: None,
             verification: None,
+            headless: false,
         }
     }
 
