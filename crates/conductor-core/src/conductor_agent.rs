@@ -214,7 +214,16 @@ impl ConductorAgent {
         phase: &Phase,
         completed_phases: &[Phase],
     ) -> Result<Vec<Task>, CoreError> {
-        self.ensure_session()?;
+        // Re-create session if closed (e.g. after long phase execution)
+        if !self.has_session() {
+            self.create_session(ClaudeSessionOptions {
+                model: self.model.clone(),
+                max_turns: Some(10),
+                allowed_tools: Some(vec!["Read".into(), "Glob".into(), "Grep".into()]),
+                append_system_prompt: None,
+                cwd: Some(self.cwd.clone()),
+            });
+        }
         let prompt = detail_phase_prompt(phase, completed_phases);
         let output = self.send_and_collect(&prompt).await?;
         let parsed: serde_json::Value = parse_json_value_from_output(&output)?;
@@ -228,7 +237,16 @@ impl ConductorAgent {
 
     /// Retry phase detailing in the same session by nudging the LLM to produce valid JSON.
     pub async fn retry_detail_phase(&mut self) -> Result<Vec<Task>, CoreError> {
-        self.ensure_session()?;
+        // Re-create session if closed
+        if !self.has_session() {
+            self.create_session(ClaudeSessionOptions {
+                model: self.model.clone(),
+                max_turns: Some(10),
+                allowed_tools: Some(vec!["Read".into(), "Glob".into(), "Grep".into()]),
+                append_system_prompt: None,
+                cwd: Some(self.cwd.clone()),
+            });
+        }
         let prompt = "Your previous response was cut off or contained invalid JSON. \
             Please respond ONLY with the JSON object containing a \"tasks\" array as specified \
             in the earlier instructions. Use ```json fences. Do not include any other text outside the JSON block.";

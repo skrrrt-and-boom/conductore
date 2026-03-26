@@ -703,6 +703,7 @@ impl Orchestra {
                     if let Err(e) = self.start_execution().await {
                         tracing::error!(error = %e, "failed to start execution");
                         self.set_phase(OrchestraPhase::Failed);
+                        let _ = self.persist_state().await;
                     }
                 }
             }
@@ -1715,11 +1716,15 @@ impl Orchestra {
                 let detail_result = self.run_conductor_op(move |mut conductor| {
                     Box::pin(async move {
                         let result = conductor.detail_phase(&phase_ref, &completed_ref).await;
-                        // On JSON parse failure, retry once with a nudge prompt
+                        // On recoverable failure, retry once
                         let result = match result {
                             Err(CoreError::JsonParse { .. }) => {
                                 tracing::warn!("phase detailing JSON parse failed, retrying...");
                                 conductor.retry_detail_phase().await
+                            }
+                            Err(CoreError::Bridge(_) | CoreError::Channel(_) | CoreError::Timeout(_)) => {
+                                tracing::warn!("phase detailing session error, retrying with fresh session...");
+                                conductor.detail_phase(&phase_ref, &completed_ref).await
                             }
                             other => other,
                         };
@@ -1742,6 +1747,7 @@ impl Orchestra {
                         self.phases[pi].status = PhaseStatus::Failed;
                         self.set_phase(OrchestraPhase::Failed);
                         self.broadcast_state();
+                        let _ = self.persist_state().await;
                         return Err(CoreError::JsonParse { reason, raw_output });
                     }
                     Err(e) => {
@@ -1752,16 +1758,17 @@ impl Orchestra {
                         self.phases[pi].status = PhaseStatus::Failed;
                         self.set_phase(OrchestraPhase::Failed);
                         self.broadcast_state();
+                        let _ = self.persist_state().await;
                         return Err(e);
                     }
                 };
 
+                let total_phase_tasks = detailed_tasks.len();
                 let base_index = self.tasks.len();
                 for (ti, mut task) in detailed_tasks.into_iter().enumerate() {
                     task.index = base_index + ti;
-                    // Guard: filter out-of-phase dependencies
-                    let phase_task_count = self.phases[pi].tasks.len() + 1; // +1 for current
-                    task.dependencies.retain(|&dep| dep < phase_task_count);
+                    // Guard: filter out-of-phase and self-referential dependencies
+                    task.dependencies.retain(|&dep| dep < total_phase_tasks && dep != ti);
                     self.tasks.push(task.clone());
                     self.phases[pi].tasks.push(task);
                 }

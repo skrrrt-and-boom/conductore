@@ -217,44 +217,6 @@ pub const BORDER_FOCUS: Color = THEME.border_focus;
 /// Section labels, slightly brighter than MUTED but not full secondary
 pub const TEXT_LABEL: Color = THEME.text_label;
 
-// ── Theme Struct ──────────────────────────────────────────────────────────────
-
-/// Central theme token struct. Provides named semantic color fields as a
-/// single import point. Use `THEME.<field>` instead of bare color constants.
-pub struct Theme {
-    pub bg: Color,
-    pub surface: Color,
-    pub surface_elevated: Color,
-    pub border: Color,
-    pub border_focus: Color,
-    pub text_primary: Color,
-    pub text_secondary: Color,
-    pub text_muted: Color,
-    pub text_label: Color,
-    pub accent: Color,
-    pub accent_dim: Color,
-    pub success: Color,
-    pub error: Color,
-    pub warning: Color,
-}
-
-/// Global theme instance — import with `use crate::theme::THEME`.
-pub const THEME: Theme = Theme {
-    bg: BG,
-    surface: SURFACE,
-    surface_elevated: SURFACE_ELEVATED,
-    border: BORDER,
-    border_focus: BORDER_FOCUS,
-    text_primary: TEXT_PRIMARY,
-    text_secondary: TEXT_SECONDARY,
-    text_muted: TEXT_MUTED,
-    text_label: TEXT_LABEL,
-    accent: ACCENT,
-    accent_dim: ACCENT_DIM,
-    success: SUCCESS,
-    error: ERROR,
-    warning: WARNING,
-};
 
 // ── Legacy Aliases (keep callers outside this file compiling) ─────────────────
 
