@@ -16,7 +16,7 @@ use ratatui::{
 use conductor_types::{OrchestraState, TaskStatus};
 
 use crate::app::Tab;
-use crate::theme::{self, C_BRAND, C_DIM, C_TEXT};
+use crate::theme::{self, THEME};
 
 // ── Header rendering ──────────────────────────────────────────────────────────
 
@@ -50,7 +50,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &OrchestraState, active_t
         left.push(Span::raw("  "));
         left.push(Span::styled(
             format!("{done}/{total} tasks"),
-            Style::default().fg(C_TEXT),
+            Style::default().fg(THEME.text_primary),
         ));
     }
 
@@ -58,7 +58,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &OrchestraState, active_t
         left.push(Span::raw("  "));
         left.push(Span::styled(
             format!("{musician_count} musicians"),
-            Style::default().fg(C_TEXT),
+            Style::default().fg(THEME.text_primary),
         ));
     }
 
@@ -66,7 +66,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &OrchestraState, active_t
         left.push(Span::raw("  "));
         left.push(Span::styled(
             theme::elapsed(state.elapsed_ms),
-            Style::default().fg(C_TEXT),
+            Style::default().fg(THEME.text_primary),
         ));
     }
 
@@ -74,7 +74,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &OrchestraState, active_t
         left.push(Span::raw("  "));
         left.push(Span::styled(
             format!("{} insights", state.insights.len()),
-            Style::default().fg(C_BRAND),
+            Style::default().fg(THEME.accent),
         ));
     }
 
@@ -110,7 +110,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &OrchestraState, active_t
     spans.extend(right);
 
     f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().fg(C_DIM)),
+        Paragraph::new(Line::from(spans)).style(Style::default().fg(THEME.text_muted)),
         area,
     );
 }
