@@ -6,31 +6,22 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{List, ListItem, Paragraph},
     Frame,
 };
 
 use conductor_types::{Insight, InsightCategory, Task};
 
-use crate::theme::{self, C_BRAND, C_DIM, C_FRAME, C_INFO, C_TEXT};
+use crate::theme::{self, C_BRAND, C_DIM, C_INFO, C_TEXT, SURFACE, SURFACE_ELEVATED};
+use crate::widgets::{render_borderless_panel, render_empty_state};
 
 /// Render the insights panel on the right side of the screen.
 pub fn render_insight_panel(f: &mut Frame, area: Rect, insights: &[Insight]) {
     let title = format!(" Insights ({}) ", insights.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(C_FRAME))
-        .title(Span::styled(title, Style::default().fg(C_BRAND)));
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = render_borderless_panel(f, area, Some(&title), SURFACE_ELEVATED);
 
     if insights.is_empty() {
-        let empty = Paragraph::new(Span::styled(
-            "No insights yet",
-            Style::default().fg(C_DIM),
-        ));
-        f.render_widget(empty, inner);
+        render_empty_state(f, inner, "No insights yet");
         return;
     }
 
@@ -70,13 +61,7 @@ pub fn render_insight_panel(f: &mut Frame, area: Rect, insights: &[Insight]) {
 
 /// Render a vertical task dependency graph.
 pub fn render_task_graph(f: &mut Frame, area: Rect, tasks: &[Task]) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(C_FRAME))
-        .title(Span::styled(" Tasks ", Style::default().fg(C_TEXT)));
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = render_borderless_panel(f, area, Some(" Tasks"), SURFACE);
 
     if tasks.is_empty() {
         return;
