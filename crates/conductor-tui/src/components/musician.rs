@@ -14,7 +14,7 @@ use conductor_types::MusicianState;
 
 use crate::{
     layout::{compute_column_widths, LayoutConfig},
-    theme::{self, C_BRAND, C_DIM, C_TEXT},
+    theme::{self, THEME},
 };
 
 /// Render the musician grid — splits area into columns, one per musician.
@@ -68,7 +68,7 @@ pub fn render_musician_grid(
                 1,
             );
             f.render_widget(
-                Paragraph::new(Span::styled(badge, Style::default().fg(C_DIM))),
+                Paragraph::new(Span::styled(badge, Style::default().fg(THEME.text_muted))),
                 badge_area,
             );
         }
@@ -113,7 +113,7 @@ fn render_musician_column(
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(
             theme::trunc(&title, area.width.saturating_sub(2) as usize),
-            Style::default().fg(if is_focused { C_BRAND } else { C_TEXT }),
+            Style::default().fg(if is_focused { THEME.accent } else { THEME.text_primary }),
         ));
 
     let inner = block.inner(area);
@@ -158,6 +158,6 @@ fn render_musician_column(
 
     // Stats line: elapsed
     let elapsed = theme::elapsed(musician.elapsed_ms);
-    let stats = Line::from(Span::styled(elapsed, Style::default().fg(C_DIM)));
+    let stats = Line::from(Span::styled(elapsed, Style::default().fg(THEME.text_muted)));
     f.render_widget(Paragraph::new(stats), stats_area);
 }
