@@ -10,7 +10,7 @@ use ratatui::{
 
 use conductor_types::{OrchestraPhase, OrchestraState};
 
-use crate::theme::{self, C_DIM, SEPARATOR_DOT, SURFACE};
+use crate::theme::{self, THEME, SEPARATOR_DOT};
 use crate::widgets::render_key_hint;
 
 /// Render the single-row status bar at the bottom.
@@ -29,7 +29,7 @@ pub fn render_status_line(f: &mut Frame, area: Rect, state: &OrchestraState) {
     if !state.config.session_id.is_empty() {
         left.push(Span::styled(
             format!(" [{}]", theme::trunc(&state.config.session_id, 8)),
-            Style::default().fg(C_DIM),
+            Style::default().fg(THEME.text_muted),
         ));
     }
 
@@ -52,7 +52,7 @@ pub fn render_status_line(f: &mut Frame, area: Rect, state: &OrchestraState) {
         if i > 0 {
             right.push(Span::styled(
                 format!(" {} ", SEPARATOR_DOT),
-                Style::default().fg(C_DIM),
+                Style::default().fg(THEME.text_muted),
             ));
         }
         right.extend(render_key_hint(key, action));
@@ -68,6 +68,6 @@ pub fn render_status_line(f: &mut Frame, area: Rect, state: &OrchestraState) {
     left.extend(right);
 
     let line = Line::from(left);
-    let bar = Paragraph::new(line).style(Style::default().bg(SURFACE));
+    let bar = Paragraph::new(line).style(Style::default().bg(THEME.surface));
     f.render_widget(bar, area);
 }
