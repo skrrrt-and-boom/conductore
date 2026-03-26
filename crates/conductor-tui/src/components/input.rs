@@ -111,7 +111,7 @@ pub fn render_prompt_bar(
     let mut spans: Vec<Span> = prefix_spans.into_iter().collect();
     spans.extend(visible_spans);
 
-    let prompt = Paragraph::new(Line::from(spans));
+    let prompt = Paragraph::new(Line::from(spans)).style(Style::default().bg(SURFACE));
     f.render_widget(prompt, area);
 
     // Show cursor position accounting for horizontal scroll
