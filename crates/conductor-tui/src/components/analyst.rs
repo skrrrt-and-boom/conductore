@@ -2,9 +2,8 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
@@ -12,7 +11,8 @@ use conductor_types::AnalystState;
 
 use crate::{
     layout::LayoutConfig,
-    theme::{self, C_BRAND, C_DIM, C_TEXT},
+    theme,
+    widgets::{render_card, render_inline_kv, render_section_header},
 };
 
 /// Render the analyst grid — one column per analyst.
@@ -50,6 +50,12 @@ fn render_analyst_column(
     analyst: &AnalystState,
     layout: &LayoutConfig,
 ) {
+    let inner = render_card(f, area, false);
+
+    if inner.height < 3 || inner.width < 4 {
+        return;
+    }
+
     let status_d = theme::status_display(&analyst.status);
     let area_label = analyst
         .directive
@@ -64,25 +70,14 @@ fn render_analyst_column(
         area_label,
     );
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(C_BRAND))
-        .title(Span::styled(
-            theme::trunc(&title, area.width.saturating_sub(2) as usize),
-            Style::default().fg(C_TEXT),
-        ));
+    // Header row: analyst name + status
+    let header_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    render_section_header(f, header_area, &theme::trunc(&title, inner.width as usize), None);
 
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if inner.height < 2 || inner.width < 4 {
-        return;
-    }
-
-    // Reserve 1 row for stats
-    let output_height = inner.height.saturating_sub(1);
-    let output_area = Rect::new(inner.x, inner.y, inner.width, output_height);
-    let stats_area = Rect::new(inner.x, inner.y + output_height, inner.width, 1);
+    // Reserve 1 row for header and 1 row for stats
+    let output_height = inner.height.saturating_sub(2);
+    let output_area = Rect::new(inner.x, inner.y + 1, inner.width, output_height);
+    let stats_area = Rect::new(inner.x, inner.y + 1 + output_height, inner.width, 1);
 
     let total_lines = analyst.output_lines.len();
     let lines: Vec<Line> = analyst
@@ -108,6 +103,5 @@ fn render_analyst_column(
     f.render_widget(output, output_area);
 
     let elapsed = theme::elapsed(analyst.elapsed_ms);
-    let stats = Line::from(Span::styled(elapsed, Style::default().fg(C_DIM)));
-    f.render_widget(Paragraph::new(stats), stats_area);
+    f.render_widget(Paragraph::new(render_inline_kv("elapsed", &elapsed)), stats_area);
 }
