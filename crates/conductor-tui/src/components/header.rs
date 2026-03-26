@@ -13,7 +13,7 @@ use ratatui::{
     Frame,
 };
 
-use conductor_types::{OrchestraState, TaskStatus};
+use conductor_types::{state::RateLimitStatus, OrchestraState, TaskStatus};
 
 use crate::app::Tab;
 use crate::theme::{self, THEME};
@@ -47,11 +47,29 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &OrchestraState, active_t
     ];
 
     if total > 0 {
+        let pct = done as f64 / total as f64;
+        let filled = (pct * 10_f64).round() as usize;
+        let filled = filled.min(10);
+
         left.push(Span::raw("  "));
         left.push(Span::styled(
             format!("{done}/{total} tasks"),
             Style::default().fg(THEME.text_primary),
         ));
+        left.push(Span::raw(" "));
+        left.push(Span::styled(
+            "█".repeat(filled),
+            Style::default().fg(THEME.success),
+        ));
+        left.push(Span::styled(
+            "░".repeat(10 - filled),
+            Style::default().fg(THEME.border),
+        ));
+    }
+
+    if state.rate_limit.status == RateLimitStatus::Limited {
+        left.push(Span::raw("  "));
+        left.push(Span::styled("⚠ rate limited", Style::default().fg(THEME.error)));
     }
 
     if musician_count > 0 {
