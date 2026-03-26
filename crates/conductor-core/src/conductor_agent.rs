@@ -10,9 +10,9 @@ use std::path::Path;
 
 use conductor_bridge::{ClaudeSession, ClaudeSessionOptions};
 use conductor_types::{
-    AnalysisDirective, AnalysisResult, ClaudeEvent, ClaudeEventType, CodebaseMap, GuidanceActions,
-    GuidanceInput, OrchestraEvent, Phase, PhaseReviewAction, PhaseReviewResult, Plan, PlanInsight,
-    Task, TaskStatus,
+    truncate_str, truncate_str_tail, AnalysisDirective, AnalysisResult, ClaudeEvent,
+    ClaudeEventType, CodebaseMap, GuidanceActions, GuidanceInput, OrchestraEvent, Phase,
+    PhaseReviewAction, PhaseReviewResult, Plan, PlanInsight, Task, TaskStatus,
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -217,6 +217,22 @@ impl ConductorAgent {
         self.ensure_session()?;
         let prompt = detail_phase_prompt(phase, completed_phases);
         let output = self.send_and_collect(&prompt).await?;
+        let parsed: serde_json::Value = parse_json_value_from_output(&output)?;
+        let raw_tasks = parsed
+            .get("tasks")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(parse_tasks(&raw_tasks))
+    }
+
+    /// Retry phase detailing in the same session by nudging the LLM to produce valid JSON.
+    pub async fn retry_detail_phase(&mut self) -> Result<Vec<Task>, CoreError> {
+        self.ensure_session()?;
+        let prompt = "Your previous response was cut off or contained invalid JSON. \
+            Please respond ONLY with the JSON object containing a \"tasks\" array as specified \
+            in the earlier instructions. Use ```json fences. Do not include any other text outside the JSON block.";
+        let output = self.send_and_collect(prompt).await?;
         let parsed: serde_json::Value = parse_json_value_from_output(&output)?;
         let raw_tasks = parsed
             .get("tasks")
@@ -633,11 +649,7 @@ fn intelligent_truncate(content: &str, max_chars: usize) -> String {
                 let heading = &section[..heading_end];
                 let rest = &section[heading_end + 1..];
                 let first_para = rest.split("\n\n").next().unwrap_or("");
-                let truncated_para = if first_para.len() > 200 {
-                    &first_para[..200]
-                } else {
-                    first_para
-                };
+                let truncated_para = truncate_str(first_para, 200);
                 let summary =
                     format!("{heading}\n{truncated_para}...\n[...section truncated]\n\n");
                 if summary.len() <= remaining {
@@ -1522,12 +1534,7 @@ fn detail_phase_prompt(phase: &Phase, completed_phases: &[Phase]) -> String {
                             .result
                             .as_ref()
                             .map(|r| {
-                                let s = &r.summary;
-                                if s.len() > 150 {
-                                    format!(": {}", &s[..150])
-                                } else {
-                                    format!(": {s}")
-                                }
+                                format!(": {}", truncate_str(&r.summary, 150))
                             })
                             .unwrap_or_default();
                         format!("- {} [{:?}]{}", t.title, t.status, summary)
@@ -1615,11 +1622,7 @@ fn phase_review_prompt(
         entries
             .iter()
             .map(|(idx, diff)| {
-                let truncated = if diff.len() > 3000 {
-                    &diff[..3000]
-                } else {
-                    diff.as_str()
-                };
+                let truncated = truncate_str(diff, 3000);
                 format!("### Task {idx}\n```diff\n{truncated}\n```")
             })
             .collect::<Vec<_>>()
@@ -1707,11 +1710,7 @@ fn review_prompt(input: &ReviewInput) -> String {
     if !recent_entries.is_empty() {
         diff_section.push_str("## Git Diffs (recent tasks)\n");
         for (idx, diff) in recent_entries {
-            let truncated = if diff.len() > 3000 {
-                &diff[..3000]
-            } else {
-                diff.as_str()
-            };
+            let truncated = truncate_str(diff, 3000);
             diff_section.push_str(&format!(
                 "### Task {}\n```diff\n{}\n```\n\n",
                 *idx + 1,
@@ -1728,11 +1727,7 @@ fn review_prompt(input: &ReviewInput) -> String {
             let entries: String = v
                 .iter()
                 .map(|(idx, result)| {
-                    let truncated = if result.len() > 2000 {
-                        &result[..2000]
-                    } else {
-                        result.as_str()
-                    };
+                    let truncated = truncate_str(result, 2000);
                     format!("### Task {}\n```\n{}\n```", idx + 1, truncated)
                 })
                 .collect::<Vec<_>>()
@@ -1744,7 +1739,7 @@ fn review_prompt(input: &ReviewInput) -> String {
     let shared_mem = if input.shared_memory.len() > 4000 {
         format!(
             "[...earlier entries truncated]\n\n{}",
-            &input.shared_memory[input.shared_memory.len() - 4000..]
+            truncate_str_tail(&input.shared_memory, 4000)
         )
     } else {
         input.shared_memory.clone()
@@ -1774,7 +1769,7 @@ fn guidance_prompt(input: &GuidanceInput) -> String {
     let shared_mem = if input.shared_memory.len() > 2000 {
         format!(
             "[...earlier entries truncated]\n\n{}",
-            &input.shared_memory[input.shared_memory.len() - 2000..]
+            truncate_str_tail(&input.shared_memory, 2000)
         )
     } else {
         input.shared_memory.clone()

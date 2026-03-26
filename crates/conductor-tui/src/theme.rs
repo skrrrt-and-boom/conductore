@@ -38,6 +38,17 @@ pub const ERROR: Color = Color::Rgb(248, 113, 113);
 /// Warm amber warning state
 pub const WARNING: Color = Color::Rgb(251, 191, 36);
 
+// ── Extended Semantic Colors ───────────────────────────────────────────────────
+
+/// Cards/panels that float above SURFACE — one step elevated
+pub const SURFACE_ELEVATED: Color = Color::Rgb(25, 25, 25);
+/// Dimmed accent for inactive tab indicators — subdued but recognizable
+pub const ACCENT_DIM: Color = Color::Rgb(45, 100, 180);
+/// Slightly brighter border for focused panels — still subtle
+pub const BORDER_FOCUS: Color = Color::Rgb(50, 50, 50);
+/// Section labels, slightly brighter than MUTED but not full secondary
+pub const TEXT_LABEL: Color = Color::Rgb(100, 100, 100);
+
 // ── Legacy Aliases (keep callers outside this file compiling) ─────────────────
 
 /// Borders, dividers — recede
@@ -99,6 +110,50 @@ pub fn s_heading() -> Style {
 /// Separator style: border color for thin lines
 pub fn s_separator() -> Style {
     Style::default().fg(BORDER)
+}
+
+/// Label style: TEXT_LABEL color for section headers
+pub fn s_label() -> Style {
+    Style::default().fg(TEXT_LABEL)
+}
+
+/// Surface background style
+pub fn s_surface() -> Style {
+    Style::default().bg(SURFACE)
+}
+
+/// Elevated surface background style — for cards/panels floating above SURFACE
+pub fn s_surface_elevated() -> Style {
+    Style::default().bg(SURFACE_ELEVATED)
+}
+
+/// Active tab style: accent color + bold
+pub fn s_tab_active() -> Style {
+    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+}
+
+/// Inactive tab style: muted text
+pub fn s_tab_inactive() -> Style {
+    Style::default().fg(TEXT_MUTED)
+}
+
+// ── Tab Display ───────────────────────────────────────────────────────────────
+
+/// Returns styled spans for a tab indicator in `[1]Orchestra` format.
+///
+/// - Active: accent color + bold
+/// - Visible but inactive: muted text
+/// - Not visible: empty vec (skip entirely)
+pub fn tab_indicator(label: &str, key: char, is_active: bool, is_visible: bool) -> Vec<Span<'_>> {
+    if !is_visible {
+        return vec![];
+    }
+    let text = format!("[{}]{}", key, label);
+    if is_active {
+        vec![Span::styled(text, s_tab_active())]
+    } else {
+        vec![Span::styled(text, s_tab_inactive())]
+    }
 }
 
 // ── Separator Helpers ─────────────────────────────────────────────────────────
@@ -610,6 +665,89 @@ mod tests {
     #[test]
     fn separator_dot_is_middle_dot() {
         assert_eq!(SEPARATOR_DOT, "·");
+    }
+
+    // new style helpers
+
+    #[test]
+    fn s_label_returns_text_label() {
+        assert_eq!(s_label().fg, Some(TEXT_LABEL));
+    }
+
+    #[test]
+    fn s_surface_sets_bg() {
+        assert_eq!(s_surface().bg, Some(SURFACE));
+    }
+
+    #[test]
+    fn s_surface_elevated_sets_bg() {
+        assert_eq!(s_surface_elevated().bg, Some(SURFACE_ELEVATED));
+    }
+
+    #[test]
+    fn s_tab_active_has_accent_and_bold() {
+        let style = s_tab_active();
+        assert_eq!(style.fg, Some(ACCENT));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn s_tab_inactive_returns_muted() {
+        assert_eq!(s_tab_inactive().fg, Some(TEXT_MUTED));
+    }
+
+    // tab_indicator()
+
+    #[test]
+    fn tab_indicator_invisible_returns_empty() {
+        let spans = tab_indicator("Orchestra", '1', true, false);
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn tab_indicator_active_formats_correctly() {
+        let spans = tab_indicator("Orchestra", '1', true, true);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "[1]Orchestra");
+        assert_eq!(spans[0].style.fg, Some(ACCENT));
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn tab_indicator_inactive_formats_correctly() {
+        let spans = tab_indicator("Log", '2', false, true);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "[2]Log");
+        assert_eq!(spans[0].style.fg, Some(TEXT_MUTED));
+    }
+
+    #[test]
+    fn tab_indicator_inactive_is_not_bold() {
+        let spans = tab_indicator("Log", '2', false, true);
+        assert!(!spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    // new color constants
+
+    #[test]
+    fn surface_elevated_is_distinct_from_surface() {
+        assert_ne!(SURFACE_ELEVATED, SURFACE);
+    }
+
+    #[test]
+    fn accent_dim_is_distinct_from_accent() {
+        assert_ne!(ACCENT_DIM, ACCENT);
+    }
+
+    #[test]
+    fn border_focus_is_distinct_from_border() {
+        assert_ne!(BORDER_FOCUS, BORDER);
+    }
+
+    #[test]
+    fn text_label_is_distinct_from_muted_and_secondary() {
+        assert_ne!(TEXT_LABEL, TEXT_MUTED);
+        assert_ne!(TEXT_LABEL, TEXT_SECONDARY);
     }
 
     // legacy alias consistency

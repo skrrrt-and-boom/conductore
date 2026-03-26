@@ -1715,6 +1715,14 @@ impl Orchestra {
                 let detail_result = self.run_conductor_op(move |mut conductor| {
                     Box::pin(async move {
                         let result = conductor.detail_phase(&phase_ref, &completed_ref).await;
+                        // On JSON parse failure, retry once with a nudge prompt
+                        let result = match result {
+                            Err(CoreError::JsonParse { .. }) => {
+                                tracing::warn!("phase detailing JSON parse failed, retrying...");
+                                conductor.retry_detail_phase().await
+                            }
+                            other => other,
+                        };
                         (conductor, result)
                     })
                 }).await;
@@ -1723,7 +1731,7 @@ impl Orchestra {
                     Ok(tasks) => tasks,
                     Err(CoreError::JsonParse { reason, raw_output }) => {
                         self.push_conductor_output(&format!(
-                            "Phase {} detailing failed: {reason}",
+                            "Phase {} detailing failed after retry: {reason}",
                             pi + 1
                         ));
                         if !raw_output.is_empty() {

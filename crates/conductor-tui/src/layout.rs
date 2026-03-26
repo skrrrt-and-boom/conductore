@@ -1,4 +1,5 @@
 use conductor_types::state::{MusicianState, MusicianStatus};
+use ratatui::layout::Rect;
 
 // ─── Breakpoints ─────────────────────────────────────────────────────────────
 
@@ -11,17 +12,17 @@ pub const TALL: u16 = 40;
 
 // ─── Default Sizing ──────────────────────────────────────────────────────────
 
-pub const INSIGHTS_WIDTH: u16 = 32;
+pub const INSIGHTS_WIDTH: u16 = 36;
 pub const INSIGHTS_WIDTH_MIN: u16 = 24;
 pub const INSIGHTS_WIDTH_MAX: u16 = 40;
-pub const PANEL_PADDING: u16 = 1;
-pub const PANEL_PADDING_MIN: u16 = 0;
+pub const CELL_PADDING: u16 = 1;
+pub const CELL_PADDING_MIN: u16 = 0;
 pub const MAX_OUTPUT_LINES: usize = 8;
 pub const MAX_OUTPUT_LINES_MIN: usize = 3;
-pub const MAX_OUTPUT_LINES_MAX: usize = 16;
+pub const MAX_OUTPUT_LINES_MAX: usize = 20;
 pub const TRUNCATE_AT: usize = 72;
 pub const MIN_COLUMN_WIDTH: u16 = 28;
-pub const COLLAPSED_WIDTH: u16 = 6;
+pub const COLLAPSED_WIDTH: u16 = 4;
 
 // ─── Layout Configuration ────────────────────────────────────────────────────
 
@@ -35,8 +36,12 @@ pub struct LayoutConfig {
     pub max_output_lines: usize,
     /// Character position at which to truncate text.
     pub truncate_at: usize,
-    /// Horizontal padding for panels.
-    pub panel_padding: u16,
+    /// Horizontal padding for cells.
+    pub cell_padding: u16,
+    /// Horizontal padding for content within areas.
+    pub content_padding: u16,
+    /// Vertical gap between sections.
+    pub section_gap: u16,
     /// Width of the insights panel.
     pub insights_panel_width: u16,
     /// Minimum column width before collapsing idle musicians.
@@ -80,18 +85,39 @@ pub fn get_layout_config(width: u16, height: u16) -> LayoutConfig {
     };
     let truncate_at = 40_usize.max((available_width.saturating_sub(8) as usize).min(120));
 
-    // Panel padding
-    let panel_padding = if is_narrow { PANEL_PADDING_MIN } else { PANEL_PADDING };
+    // Cell padding (border/chrome padding)
+    let cell_padding = if is_narrow { CELL_PADDING_MIN } else { CELL_PADDING };
+
+    // Content padding (horizontal inset for readable text)
+    let content_padding = if is_wide { 2 } else if is_narrow { 0 } else { 1 };
 
     LayoutConfig {
         show_insights_panel,
         musician_columns,
         max_output_lines,
         truncate_at,
-        panel_padding,
+        cell_padding,
+        content_padding,
+        section_gap: 1,
         insights_panel_width,
         min_column_width: MIN_COLUMN_WIDTH,
     }
+}
+
+/// Shrinks a `Rect` by `h_pad` on left/right and `v_pad` on top/bottom.
+pub fn padded_rect(area: Rect, h_pad: u16, v_pad: u16) -> Rect {
+    Rect {
+        x: area.x + h_pad,
+        y: area.y + v_pad,
+        width: area.width.saturating_sub(h_pad * 2),
+        height: area.height.saturating_sub(v_pad * 2),
+    }
+}
+
+/// Applies `config.content_padding` horizontally to `area`, leaving vertical
+/// position and height unchanged.
+pub fn inner_content_rect(area: Rect, config: &LayoutConfig) -> Rect {
+    padded_rect(area, config.content_padding, 0)
 }
 
 /// Compute per-column widths. Active musicians get full columns,
@@ -205,7 +231,7 @@ mod tests {
         let cfg = get_layout_config(60, 20);
         assert!(!cfg.show_insights_panel);
         assert_eq!(cfg.insights_panel_width, 0);
-        assert_eq!(cfg.panel_padding, PANEL_PADDING_MIN);
+        assert_eq!(cfg.cell_padding, CELL_PADDING_MIN);
         assert_eq!(cfg.musician_columns, 1);
     }
 
@@ -240,16 +266,33 @@ mod tests {
 
     #[test]
     fn insights_width_clamped_for_medium_terminal() {
-        // width=100, 25% = 25 which is between MIN(24) and DEFAULT(32) → 25
+        // width=100, 25% = 25 which is between MIN(24) and DEFAULT(36) → 25
         let cfg = get_layout_config(100, 30);
         assert_eq!(cfg.insights_panel_width, 25);
     }
 
     #[test]
     fn insights_width_uses_default_when_wide_enough() {
-        // width=140, 25% = 35 > DEFAULT(32) → clamped to 32
-        let cfg = get_layout_config(140, 30);
+        // width=148, 25% = 37 > DEFAULT(36) → clamped to 36
+        let cfg = get_layout_config(148, 30);
         assert_eq!(cfg.insights_panel_width, INSIGHTS_WIDTH);
+    }
+
+    #[test]
+    fn content_padding_scales_with_terminal_width() {
+        let narrow = get_layout_config(60, 30);
+        let normal = get_layout_config(120, 30);
+        let wide = get_layout_config(200, 30);
+        assert_eq!(narrow.content_padding, 0);
+        assert_eq!(normal.content_padding, 1);
+        assert_eq!(wide.content_padding, 2);
+    }
+
+    #[test]
+    fn section_gap_is_always_one() {
+        assert_eq!(get_layout_config(60, 20).section_gap, 1);
+        assert_eq!(get_layout_config(120, 30).section_gap, 1);
+        assert_eq!(get_layout_config(200, 50).section_gap, 1);
     }
 
     // ─── compute_column_widths tests ─────────────────────────────────────────
@@ -316,5 +359,52 @@ mod tests {
             .collect();
         let widths = compute_column_widths(&musicians, 100, MIN_COLUMN_WIDTH);
         assert_eq!(widths.iter().sum::<u16>(), 100);
+    }
+
+    // ─── padded_rect tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn padded_rect_shrinks_by_padding() {
+        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
+        let result = padded_rect(area, 2, 1);
+        assert_eq!(result.x, 2);
+        assert_eq!(result.y, 1);
+        assert_eq!(result.width, 36);  // 40 - 2*2
+        assert_eq!(result.height, 18); // 20 - 2*1
+    }
+
+    #[test]
+    fn padded_rect_zero_padding_is_identity() {
+        let area = Rect { x: 5, y: 3, width: 80, height: 24 };
+        assert_eq!(padded_rect(area, 0, 0), area);
+    }
+
+    #[test]
+    fn padded_rect_saturates_at_zero_not_underflow() {
+        let area = Rect { x: 0, y: 0, width: 2, height: 2 };
+        let result = padded_rect(area, 5, 5);
+        // width/height should not underflow
+        assert_eq!(result.width, 0);
+        assert_eq!(result.height, 0);
+    }
+
+    // ─── inner_content_rect tests ────────────────────────────────────────────
+
+    #[test]
+    fn inner_content_rect_applies_content_padding_horizontally() {
+        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let config = get_layout_config(200, 30); // wide → content_padding = 2
+        let result = inner_content_rect(area, &config);
+        assert_eq!(result.x, 2);
+        assert_eq!(result.y, 0);       // no vertical change
+        assert_eq!(result.width, 76);  // 80 - 2*2
+        assert_eq!(result.height, 24); // unchanged
+    }
+
+    #[test]
+    fn inner_content_rect_zero_padding_on_narrow() {
+        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let config = get_layout_config(60, 20); // narrow → content_padding = 0
+        assert_eq!(inner_content_rect(area, &config), area);
     }
 }

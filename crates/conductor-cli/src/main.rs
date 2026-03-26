@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use conductor_bridge::{validate_claude_cli, validate_model};
 use conductor_core::{orchestra::Orchestra, task_store::TaskStore, CoreError};
-use conductor_types::OrchestraConfig;
+use conductor_types::{truncate_str, OrchestraConfig};
 use tracing::info;
 use uuid::Uuid;
 
@@ -198,7 +198,7 @@ async fn list_sessions() -> Result<()> {
         };
         let phase = format!("{:?}", s.phase);
         let desc = &s.config.task_description;
-        let desc_short = if desc.len() > 50 { &desc[..50] } else { desc };
+        let desc_short = truncate_str(desc, 50);
         println!(
             "  {}  {:<12}  {}/{} tasks{}  {}",
             s.id, phase, completed, task_count, cancelled_suffix, desc_short

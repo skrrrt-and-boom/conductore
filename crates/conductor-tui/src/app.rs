@@ -1,5 +1,6 @@
 //! TUI application — event loop, state management, and top-level layout composition.
 
+use std::collections::HashSet;
 use std::io::{self, Stdout};
 
 use crossterm::{
@@ -33,22 +34,218 @@ use crate::{
     layout::{get_layout_config, LayoutConfig},
 };
 
+// ─── Tab System ──────────────────────────────────────────────────────────────
+
+/// Which content fills the main area between header and prompt bars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tab {
+    Orchestra, // 1 — Musician grid + task graph + insights
+    Plan,      // 2 — Plan review, task list, refinement chat
+    Stats,     // 3 — Token costs, timing, per-musician gauges
+    Diff,      // 4 — Aggregated file diffs, per-musician attribution
+    Log,       // 5 — Full event log, filterable
+}
+
+impl Tab {
+    pub const ALL: &[Tab] = &[Tab::Orchestra, Tab::Plan, Tab::Stats, Tab::Diff, Tab::Log];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Tab::Orchestra => "Orchestra",
+            Tab::Plan => "Plan",
+            Tab::Stats => "Stats",
+            Tab::Diff => "Diff",
+            Tab::Log => "Log",
+        }
+    }
+
+    pub fn key(&self) -> char {
+        match self {
+            Tab::Orchestra => '1',
+            Tab::Plan => '2',
+            Tab::Stats => '3',
+            Tab::Diff => '4',
+            Tab::Log => '5',
+        }
+    }
+
+    pub fn from_key(c: char) -> Option<Tab> {
+        match c {
+            '1' => Some(Tab::Orchestra),
+            '2' => Some(Tab::Plan),
+            '3' => Some(Tab::Stats),
+            '4' => Some(Tab::Diff),
+            '5' => Some(Tab::Log),
+            _ => None,
+        }
+    }
+
+    pub fn is_visible(&self, phase: &OrchestraPhase) -> bool {
+        match self {
+            Tab::Orchestra => true,
+            Tab::Log => true,
+            Tab::Plan => matches!(
+                phase,
+                OrchestraPhase::PlanReview
+                    | OrchestraPhase::PhaseDetailing
+                    | OrchestraPhase::PhaseExecuting
+                    | OrchestraPhase::Executing
+                    | OrchestraPhase::PhaseMerging
+                    | OrchestraPhase::Integrating
+                    | OrchestraPhase::PhaseReviewing
+                    | OrchestraPhase::Reviewing
+                    | OrchestraPhase::FinalReview
+                    | OrchestraPhase::Complete
+                    | OrchestraPhase::Failed
+                    | OrchestraPhase::Paused
+                    | OrchestraPhase::Probing
+            ),
+            Tab::Stats => matches!(
+                phase,
+                OrchestraPhase::PhaseDetailing
+                    | OrchestraPhase::PhaseExecuting
+                    | OrchestraPhase::Executing
+                    | OrchestraPhase::PhaseMerging
+                    | OrchestraPhase::Integrating
+                    | OrchestraPhase::PhaseReviewing
+                    | OrchestraPhase::Reviewing
+                    | OrchestraPhase::FinalReview
+                    | OrchestraPhase::Complete
+                    | OrchestraPhase::Failed
+                    | OrchestraPhase::Paused
+                    | OrchestraPhase::Probing
+            ),
+            Tab::Diff => matches!(
+                phase,
+                OrchestraPhase::PhaseMerging
+                    | OrchestraPhase::Integrating
+                    | OrchestraPhase::PhaseReviewing
+                    | OrchestraPhase::Reviewing
+                    | OrchestraPhase::FinalReview
+                    | OrchestraPhase::Complete
+                    | OrchestraPhase::Failed
+            ),
+        }
+    }
+
+    /// Returns the tab to auto-switch to when entering the given phase, if any.
+    pub fn auto_switch(phase: &OrchestraPhase) -> Option<Tab> {
+        match phase {
+            OrchestraPhase::PlanReview => Some(Tab::Plan),
+            OrchestraPhase::PhaseExecuting | OrchestraPhase::Executing => Some(Tab::Orchestra),
+            OrchestraPhase::PhaseMerging | OrchestraPhase::Integrating => Some(Tab::Diff),
+            OrchestraPhase::FinalReview | OrchestraPhase::Complete => Some(Tab::Stats),
+            OrchestraPhase::Failed => Some(Tab::Log),
+            _ => None,
+        }
+    }
+}
+
+// ─── Per-Tab State ───────────────────────────────────────────────────────────
+
+/// Per-tab state container — each tab owns its own scroll and selection state.
+pub struct TabState {
+    pub orchestra: OrchestraTabState,
+    pub plan: PlanTabState,
+    pub stats: StatsTabState,
+    pub diff: DiffTabState,
+    pub log: LogTabState,
+}
+
+impl Default for TabState {
+    fn default() -> Self {
+        Self {
+            orchestra: OrchestraTabState::default(),
+            plan: PlanTabState::default(),
+            stats: StatsTabState::default(),
+            diff: DiffTabState::new(),
+            log: LogTabState::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct OrchestraTabState {
+    pub focused_musician: usize,
+    pub musician_scroll: Vec<u16>,
+    pub focus_mode: bool,
+    pub conductor_scroll: u16,
+}
+
+#[derive(Default)]
+pub struct PlanTabState {
+    pub plan_selected: usize,
+    pub plan_scroll: u16,
+    pub refinement_scroll: u16,
+    pub refinement_focused: bool,
+    pub task_detail: Option<usize>,
+    pub task_detail_scroll: u16,
+}
+
+#[derive(Default)]
+pub struct StatsTabState {
+    pub scroll: u16,
+}
+
+pub struct DiffTabState {
+    pub diff_scroll: u16,
+    pub expanded_files: HashSet<usize>,
+    pub selected_file: usize,
+    pub musician_filter: Option<usize>,
+}
+
+impl DiffTabState {
+    pub fn new() -> Self {
+        Self {
+            diff_scroll: 0,
+            expanded_files: HashSet::new(),
+            selected_file: 0,
+            musician_filter: None,
+        }
+    }
+}
+
+pub struct LogTabState {
+    pub log_scroll: u16,
+    pub log_filter: Option<String>,
+    pub auto_scroll: bool,
+    pub source_filter: Option<LogSourceFilter>,
+}
+
+impl LogTabState {
+    pub fn new() -> Self {
+        Self {
+            log_scroll: 0,
+            log_filter: None,
+            auto_scroll: true,
+            source_filter: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSourceFilter {
+    Conductor,
+    Musician(usize),
+    System,
+}
+
 // ─── UI State ────────────────────────────────────────────────────────────────
 
 /// Local UI state that doesn't leave the TUI. Orchestra doesn't see any of this.
 pub struct UiState {
-    /// Which musician column has focus (index into musicians vec).
-    pub focused_panel: usize,
-    /// Vertical scroll offset in the focused musician's output.
-    pub scroll_offset: u16,
+    /// Currently active tab.
+    pub active_tab: Tab,
+    /// Per-tab state (scroll offsets, selections, etc.).
+    pub tab_state: TabState,
+    /// Last known phase — used to detect phase transitions for auto-switch.
+    pub last_phase: OrchestraPhase,
     /// Keyboard help overlay visible.
     pub show_help: bool,
     /// Session browser overlay visible.
     pub show_sessions: bool,
     /// Insights panel visible on the right.
     pub show_insights: bool,
-    /// Task detail modal — Some(task_index) when open.
-    pub show_task_detail: Option<usize>,
     /// Current text in the prompt bar.
     pub prompt_input: String,
     /// Cursor position within prompt_input.
@@ -59,12 +256,8 @@ pub struct UiState {
     pub history_index: Option<usize>,
     /// Stashed input before history browsing started.
     pub history_stash: String,
-    /// Single-musician expanded view (full-width).
-    pub focus_mode: bool,
     /// Cached layout config from last terminal resize.
     pub layout_config: LayoutConfig,
-    /// Selected row in plan review task list.
-    pub plan_selected: usize,
     /// Selected row in session browser.
     pub session_selected: usize,
     /// Cached session list (loaded on toggle).
@@ -78,25 +271,68 @@ pub struct UiState {
 impl UiState {
     pub fn new(width: u16, height: u16) -> Self {
         Self {
-            focused_panel: 0,
-            scroll_offset: 0,
+            active_tab: Tab::Orchestra,
+            tab_state: TabState::default(),
+            last_phase: OrchestraPhase::Init,
             show_help: false,
             show_sessions: false,
             show_insights: true,
-            show_task_detail: None,
             prompt_input: String::new(),
             prompt_cursor: 0,
             prompt_history: Vec::new(),
             history_index: None,
             history_stash: String::new(),
-            focus_mode: false,
             layout_config: get_layout_config(width, height),
-            plan_selected: 0,
             session_selected: 0,
             sessions: Vec::new(),
             last_was_esc: false,
             needs_clear: false,
         }
+    }
+
+    // Convenience accessors for backward compatibility during migration.
+
+    /// Currently focused musician panel index.
+    pub fn focused_panel(&self) -> usize {
+        self.tab_state.orchestra.focused_musician
+    }
+
+    /// Scroll offset for the current context (orchestra conductor or musician).
+    pub fn scroll_offset(&self) -> u16 {
+        match self.active_tab {
+            Tab::Orchestra => {
+                let orch = &self.tab_state.orchestra;
+                orch.musician_scroll
+                    .get(orch.focused_musician)
+                    .copied()
+                    .unwrap_or(orch.conductor_scroll)
+            }
+            Tab::Plan => {
+                if self.tab_state.plan.task_detail.is_some() {
+                    self.tab_state.plan.task_detail_scroll
+                } else {
+                    self.tab_state.plan.plan_scroll
+                }
+            }
+            Tab::Stats => self.tab_state.stats.scroll,
+            Tab::Diff => self.tab_state.diff.diff_scroll,
+            Tab::Log => self.tab_state.log.log_scroll,
+        }
+    }
+
+    /// Selected plan task index.
+    pub fn plan_selected(&self) -> usize {
+        self.tab_state.plan.plan_selected
+    }
+
+    /// Whether focus mode (single-musician expanded view) is active.
+    pub fn focus_mode(&self) -> bool {
+        self.tab_state.orchestra.focus_mode
+    }
+
+    /// Task detail overlay index (now lives in Plan tab state).
+    pub fn show_task_detail(&self) -> Option<usize> {
+        self.tab_state.plan.task_detail
     }
 }
 
@@ -184,14 +420,26 @@ impl TuiApp {
 
             // Clamp indices when musician/task counts shrink
             if !state.musicians.is_empty() {
-                ui.focused_panel = ui.focused_panel.min(state.musicians.len() - 1);
+                ui.tab_state.orchestra.focused_musician =
+                    ui.tab_state.orchestra.focused_musician.min(state.musicians.len() - 1);
             } else {
-                ui.focused_panel = 0;
+                ui.tab_state.orchestra.focused_musician = 0;
             }
             if !state.tasks.is_empty() {
-                ui.plan_selected = ui.plan_selected.min(state.tasks.len() - 1);
+                ui.tab_state.plan.plan_selected =
+                    ui.tab_state.plan.plan_selected.min(state.tasks.len() - 1);
             } else {
-                ui.plan_selected = 0;
+                ui.tab_state.plan.plan_selected = 0;
+            }
+
+            // Auto-switch tab on phase transitions
+            if state.phase != ui.last_phase {
+                if let Some(tab) = Tab::auto_switch(&state.phase) {
+                    if tab.is_visible(&state.phase) {
+                        ui.active_tab = tab;
+                    }
+                }
+                ui.last_phase = state.phase.clone();
             }
 
             if ui.needs_clear {
@@ -267,7 +515,7 @@ impl TuiApp {
         if key.code == KeyCode::Esc
             && !ui.show_help
             && !ui.show_sessions
-            && ui.show_task_detail.is_none()
+            && ui.tab_state.plan.task_detail.is_none()
         {
             ui.last_was_esc = true;
             return Ok(false);
@@ -315,17 +563,18 @@ impl TuiApp {
             return Ok(false);
         }
 
-        if ui.show_task_detail.is_some() {
+        if ui.tab_state.plan.task_detail.is_some() {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
-                    ui.show_task_detail = None;
+                    ui.tab_state.plan.task_detail = None;
                     ui.needs_clear = true;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    ui.scroll_offset = ui.scroll_offset.saturating_sub(1);
+                    ui.tab_state.plan.task_detail_scroll =
+                        ui.tab_state.plan.task_detail_scroll.saturating_sub(1);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    ui.scroll_offset += 1;
+                    ui.tab_state.plan.task_detail_scroll += 1;
                 }
                 _ => {}
             }
@@ -536,6 +785,16 @@ impl TuiApp {
             return Ok(false);
         }
 
+        // Tab switching via number keys 1-5
+        if let KeyCode::Char(c @ '1'..='5') = key.code {
+            if let Some(tab) = Tab::from_key(c) {
+                if tab.is_visible(&state.phase) {
+                    ui.active_tab = tab;
+                }
+            }
+            return Ok(false);
+        }
+
         // Navigation keys (when not typing)
         match key.code {
             KeyCode::Char('q') => {
@@ -544,44 +803,25 @@ impl TuiApp {
             }
             KeyCode::Char('?') => ui.show_help = !ui.show_help,
             KeyCode::Tab => {
+                // Tab/BackTab cycle musicians within Orchestra tab
                 let _ = self.action_tx.send(UserAction::FocusNext).await;
                 let count = state.musicians.len().max(1);
-                ui.focused_panel = (ui.focused_panel + 1) % count;
-                ui.scroll_offset = 0;
+                let orch = &mut ui.tab_state.orchestra;
+                orch.focused_musician = (orch.focused_musician + 1) % count;
             }
             KeyCode::BackTab => {
                 let _ = self.action_tx.send(UserAction::FocusPrev).await;
                 let count = state.musicians.len().max(1);
-                ui.focused_panel = if ui.focused_panel == 0 { count - 1 } else { ui.focused_panel - 1 };
-                ui.scroll_offset = 0;
-            }
-            KeyCode::Left => {
-                let count = state.musicians.len().max(1);
-                ui.focused_panel = if ui.focused_panel == 0 { count - 1 } else { ui.focused_panel - 1 };
-                ui.scroll_offset = 0;
-            }
-            KeyCode::Right => {
-                let count = state.musicians.len().max(1);
-                ui.focused_panel = (ui.focused_panel + 1) % count;
-                ui.scroll_offset = 0;
-            }
-            KeyCode::Up => {
-                if state.phase == OrchestraPhase::PlanReview {
-                    ui.plan_selected = ui.plan_selected.saturating_sub(1);
+                let orch = &mut ui.tab_state.orchestra;
+                orch.focused_musician = if orch.focused_musician == 0 {
+                    count - 1
                 } else {
-                    ui.scroll_offset = ui.scroll_offset.saturating_sub(1);
-                    let _ = self.action_tx.send(UserAction::ScrollUp).await;
-                }
+                    orch.focused_musician - 1
+                };
             }
-            KeyCode::Down => {
-                if state.phase == OrchestraPhase::PlanReview {
-                    if ui.plan_selected + 1 < state.tasks.len() {
-                        ui.plan_selected += 1;
-                    }
-                } else {
-                    ui.scroll_offset += 1;
-                    let _ = self.action_tx.send(UserAction::ScrollDown).await;
-                }
+            // Route arrow keys based on active tab
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
+                self.handle_arrow_key(key.code, ui, state).await;
             }
             KeyCode::Enter => {
                 if state.phase == OrchestraPhase::PlanReview {
@@ -589,18 +829,106 @@ impl TuiApp {
                 }
             }
             KeyCode::Char('d') if state.phase == OrchestraPhase::PlanReview => {
-                ui.show_task_detail = Some(ui.plan_selected);
-                ui.scroll_offset = 0;
+                ui.tab_state.plan.task_detail = Some(ui.tab_state.plan.plan_selected);
+                ui.tab_state.plan.task_detail_scroll = 0;
             }
             KeyCode::Esc => {
-                if ui.focus_mode {
-                    ui.focus_mode = false;
+                if ui.tab_state.orchestra.focus_mode {
+                    ui.tab_state.orchestra.focus_mode = false;
                 }
             }
             _ => {}
         }
 
         Ok(false)
+    }
+
+    /// Route arrow keys to the appropriate tab handler.
+    async fn handle_arrow_key(
+        &self,
+        code: KeyCode,
+        ui: &mut UiState,
+        state: &OrchestraState,
+    ) {
+        match ui.active_tab {
+            Tab::Orchestra => {
+                let orch = &mut ui.tab_state.orchestra;
+                match code {
+                    KeyCode::Left => {
+                        let count = state.musicians.len().max(1);
+                        orch.focused_musician = if orch.focused_musician == 0 {
+                            count - 1
+                        } else {
+                            orch.focused_musician - 1
+                        };
+                    }
+                    KeyCode::Right => {
+                        let count = state.musicians.len().max(1);
+                        orch.focused_musician = (orch.focused_musician + 1) % count;
+                    }
+                    KeyCode::Up => {
+                        orch.conductor_scroll = orch.conductor_scroll.saturating_sub(1);
+                        let _ = self.action_tx.send(UserAction::ScrollUp).await;
+                    }
+                    KeyCode::Down => {
+                        orch.conductor_scroll += 1;
+                        let _ = self.action_tx.send(UserAction::ScrollDown).await;
+                    }
+                    _ => {}
+                }
+            }
+            Tab::Plan => {
+                let plan = &mut ui.tab_state.plan;
+                match code {
+                    KeyCode::Up => {
+                        plan.plan_selected = plan.plan_selected.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        if plan.plan_selected + 1 < state.tasks.len() {
+                            plan.plan_selected += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Tab::Stats => {
+                match code {
+                    KeyCode::Up => {
+                        ui.tab_state.stats.scroll =
+                            ui.tab_state.stats.scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        ui.tab_state.stats.scroll += 1;
+                    }
+                    _ => {}
+                }
+            }
+            Tab::Diff => {
+                match code {
+                    KeyCode::Up => {
+                        ui.tab_state.diff.diff_scroll =
+                            ui.tab_state.diff.diff_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        ui.tab_state.diff.diff_scroll += 1;
+                    }
+                    _ => {}
+                }
+            }
+            Tab::Log => {
+                match code {
+                    KeyCode::Up => {
+                        ui.tab_state.log.auto_scroll = false;
+                        ui.tab_state.log.log_scroll =
+                            ui.tab_state.log.log_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        ui.tab_state.log.log_scroll += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     async fn submit_input(&self, text: &str, state: &OrchestraState) {
@@ -722,7 +1050,7 @@ pub fn render_all(f: &mut Frame, state: &OrchestraState, ui: &UiState) {
         .split(size);
 
     // Header
-    header::render_header(f, main_chunks[0], state);
+    header::render_header(f, main_chunks[0], state, &ui.active_tab);
 
     // Content area — musicians + optional insights panel
     render_content(f, main_chunks[1], state, ui);
@@ -742,16 +1070,27 @@ pub fn render_all(f: &mut Frame, state: &OrchestraState, ui: &UiState) {
         panels::render_session_browser(f, size, &ui.sessions, ui.session_selected);
     }
 
-    if let Some(task_idx) = ui.show_task_detail {
+    if let Some(task_idx) = ui.tab_state.plan.task_detail {
         if let Some(task) = state.tasks.get(task_idx) {
-            panels::render_task_detail(f, size, task, &state.tasks, ui.scroll_offset);
+            panels::render_task_detail(f, size, task, &state.tasks, ui.tab_state.plan.task_detail_scroll);
         }
     }
 }
 
-/// Render the main content area based on current phase.
+/// Render the main content area based on active tab.
 fn render_content(f: &mut Frame, area: Rect, state: &OrchestraState, ui: &UiState) {
-    // During PlanReview, show the plan review panel instead of musicians
+    match ui.active_tab {
+        Tab::Orchestra => render_orchestra_tab(f, area, state, ui),
+        Tab::Plan => render_plan_tab(f, area, state, ui),
+        Tab::Stats => render_placeholder_tab(f, area, "Stats"),
+        Tab::Diff => render_placeholder_tab(f, area, "Diff"),
+        Tab::Log => render_placeholder_tab(f, area, "Log"),
+    }
+}
+
+/// Render the Orchestra tab — the original content rendering.
+fn render_orchestra_tab(f: &mut Frame, area: Rect, state: &OrchestraState, ui: &UiState) {
+    // During PlanReview, show the plan review panel in Orchestra tab too
     if state.phase == OrchestraPhase::PlanReview {
         panels::render_plan_review(
             f,
@@ -759,7 +1098,7 @@ fn render_content(f: &mut Frame, area: Rect, state: &OrchestraState, ui: &UiStat
             state.plan.as_ref(),
             &state.tasks,
             &state.refinement_history,
-            ui.plan_selected,
+            ui.tab_state.plan.plan_selected,
         );
         return;
     }
@@ -777,7 +1116,6 @@ fn render_content(f: &mut Frame, area: Rect, state: &OrchestraState, ui: &UiStat
     if is_planning {
         render_planning_content(f, area, state, ui);
     } else if ui.layout_config.show_insights_panel && ui.show_insights {
-        // Horizontal split: musicians | insights
         let content_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -791,6 +1129,38 @@ fn render_content(f: &mut Frame, area: Rect, state: &OrchestraState, ui: &UiStat
     } else {
         render_musicians(f, area, state, ui);
     }
+}
+
+/// Render the Plan tab content.
+fn render_plan_tab(f: &mut Frame, area: Rect, state: &OrchestraState, ui: &UiState) {
+    // Reuse plan review renderer when plan data is available
+    if state.plan.is_some() || !state.tasks.is_empty() {
+        panels::render_plan_review(
+            f,
+            area,
+            state.plan.as_ref(),
+            &state.tasks,
+            &state.refinement_history,
+            ui.tab_state.plan.plan_selected,
+        );
+    } else {
+        render_placeholder_tab(f, area, "Plan");
+    }
+}
+
+/// Render a placeholder empty state for tabs not yet implemented.
+fn render_placeholder_tab(f: &mut Frame, area: Rect, label: &str) {
+    use ratatui::widgets::{Block, Borders, Paragraph};
+    use ratatui::style::{Color, Style};
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {label} "))
+        .border_style(Style::default().fg(Color::DarkGray));
+    let text = Paragraph::new(format!("  {label} tab — coming soon"))
+        .style(Style::default().fg(Color::DarkGray))
+        .block(block);
+    f.render_widget(text, area);
 }
 
 /// Render content during planning phases (conductor output + optional analysts).
@@ -834,7 +1204,7 @@ fn render_planning_main(
             chunks[0],
             &state.conductor_output,
             phase_label,
-            ui.scroll_offset,
+            ui.tab_state.orchestra.conductor_scroll,
         );
         analyst::render_analyst_grid(f, chunks[1], &state.analysts, &ui.layout_config);
     } else {
@@ -843,7 +1213,7 @@ fn render_planning_main(
             area,
             &state.conductor_output,
             phase_label,
-            ui.scroll_offset,
+            ui.tab_state.orchestra.conductor_scroll,
         );
     }
 }
@@ -867,20 +1237,20 @@ fn render_musicians(f: &mut Frame, area: Rect, state: &OrchestraState, ui: &UiSt
             f,
             chunks[1],
             &state.musicians,
-            ui.focused_panel,
+            ui.focused_panel(),
             &ui.layout_config,
-            ui.focus_mode,
-            ui.scroll_offset,
+            ui.focus_mode(),
+            ui.scroll_offset(),
         );
     } else {
         musician::render_musician_grid(
             f,
             area,
             &state.musicians,
-            ui.focused_panel,
+            ui.focused_panel(),
             &ui.layout_config,
-            ui.focus_mode,
-            ui.scroll_offset,
+            ui.focus_mode(),
+            ui.scroll_offset(),
         );
     }
 }

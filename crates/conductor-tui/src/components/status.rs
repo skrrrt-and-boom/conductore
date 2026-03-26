@@ -7,26 +7,23 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
 
 use conductor_types::{OrchestraPhase, OrchestraState};
 
-use crate::theme::{self, C_DIM};
+use crate::theme::{self, C_DIM, SEPARATOR_DOT, SURFACE};
+use crate::widgets::render_key_hint;
 
 /// Render the single-row status bar at the bottom.
 pub fn render_status_line(f: &mut Frame, area: Rect, state: &OrchestraState) {
     let phase_d = theme::phase_display(&state.phase);
 
-    // Left side: phase indicator + session ID
-    let mut left = vec![
-        Span::styled(
-            format!(" {} ", phase_d.sym),
-            Style::default().fg(phase_d.color),
-        ),
-        Span::styled(
-            format!("{:?}", state.phase),
-            Style::default().fg(phase_d.color),
-        ),
+    // Left: phase symbol + phase name in phase color, then session ID in dim brackets
+    let phase_name = format!("{:?}", state.phase);
+    let mut left: Vec<Span<'static>> = vec![
+        Span::raw(" "),
+        Span::styled(phase_d.sym, Style::default().fg(phase_d.color)),
+        Span::raw(" "),
+        Span::styled(phase_name, Style::default().fg(phase_d.color)),
     ];
 
     if !state.config.session_id.is_empty() {
@@ -36,27 +33,41 @@ pub fn render_status_line(f: &mut Frame, area: Rect, state: &OrchestraState) {
         ));
     }
 
-    // Right side: phase-specific hints
-    let hint = match state.phase {
-        OrchestraPhase::PlanReview => "[Enter] approve  [↑↓] tasks  type to refine  q quit",
-        OrchestraPhase::PhaseExecuting | OrchestraPhase::Executing => {
-            "Tab: switch  type: guidance  ?: help  q: quit"
+    // Right: context-sensitive hints with middle-dot separators
+    let hints: &[(&str, &str)] = match state.phase {
+        OrchestraPhase::PlanReview => {
+            &[("⏎", "approve"), ("↑↓", "tasks"), ("?", "help"), ("q", "quit")]
         }
-        OrchestraPhase::Paused => "paused — q quit",
-        OrchestraPhase::Complete => "done — q quit",
-        OrchestraPhase::Failed => "failed — q quit",
-        _ => "?: help  q: quit",
+        OrchestraPhase::PhaseExecuting | OrchestraPhase::Executing => {
+            &[("Tab", "switch"), ("?", "help"), ("q", "quit")]
+        }
+        OrchestraPhase::Paused | OrchestraPhase::Complete | OrchestraPhase::Failed => {
+            &[("q", "quit")]
+        }
+        _ => &[("?", "help"), ("q", "quit")],
     };
 
-    // Build the line with spacing between left and right
+    let mut right: Vec<Span<'static>> = Vec::new();
+    for (i, (key, action)) in hints.iter().enumerate() {
+        if i > 0 {
+            right.push(Span::styled(
+                format!(" {} ", SEPARATOR_DOT),
+                Style::default().fg(C_DIM),
+            ));
+        }
+        right.extend(render_key_hint(key, action));
+    }
+    right.push(Span::raw(" "));
+
+    // Flexible spacing between left and right
     let left_len: usize = left.iter().map(|s| s.width()).sum();
-    let right_len = UnicodeWidthStr::width(hint);
-    let gap = (area.width as usize).saturating_sub(left_len + right_len + 1);
+    let right_len: usize = right.iter().map(|s| s.width()).sum();
+    let gap = (area.width as usize).saturating_sub(left_len + right_len);
 
     left.push(Span::raw(" ".repeat(gap)));
-    left.push(Span::styled(hint, Style::default().fg(C_DIM)));
+    left.extend(right);
 
     let line = Line::from(left);
-    let bar = Paragraph::new(line);
+    let bar = Paragraph::new(line).style(Style::default().bg(SURFACE));
     f.render_widget(bar, area);
 }

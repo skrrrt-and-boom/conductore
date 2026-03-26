@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
 
+use conductor_types::truncate_str;
+
 use crate::CoreError;
 
 /// Result of a merge operation.
@@ -281,11 +283,7 @@ impl WorktreeManager {
             };
 
             // Truncate content to 8000 chars like the TS version
-            let content_slice = if conflicted_content.len() > 8000 {
-                &conflicted_content[..8000]
-            } else {
-                &conflicted_content
-            };
+            let content_slice = truncate_str(&conflicted_content, 8000);
 
             let prompt = format!(
                 "Resolve the merge conflicts in this file. Output ONLY the resolved file content \
