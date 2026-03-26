@@ -12,15 +12,15 @@ use ratatui::{
 
 use conductor_types::{Insight, InsightCategory, Task};
 
-use crate::theme::{self, C_BRAND, C_DIM, C_FRAME, C_INFO, C_TEXT};
+use crate::theme::{self, THEME};
 
 /// Render the insights panel on the right side of the screen.
 pub fn render_insight_panel(f: &mut Frame, area: Rect, insights: &[Insight]) {
     let title = format!(" Insights ({}) ", insights.len());
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(C_FRAME))
-        .title(Span::styled(title, Style::default().fg(C_BRAND)));
+        .border_style(Style::default().fg(THEME.border))
+        .title(Span::styled(title, Style::default().fg(THEME.accent)));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -28,7 +28,7 @@ pub fn render_insight_panel(f: &mut Frame, area: Rect, insights: &[Insight]) {
     if insights.is_empty() {
         let empty = Paragraph::new(Span::styled(
             "No insights yet",
-            Style::default().fg(C_DIM),
+            Style::default().fg(THEME.text_muted),
         ));
         f.render_widget(empty, inner);
         return;
@@ -48,7 +48,7 @@ pub fn render_insight_panel(f: &mut Frame, area: Rect, insights: &[Insight]) {
                 Span::raw(" "),
                 Span::styled(
                     theme::trunc(&insight.title, (inner.width as usize).saturating_sub(6)),
-                    Style::default().fg(C_TEXT),
+                    Style::default().fg(THEME.text_primary),
                 ),
             ]);
 
@@ -57,7 +57,7 @@ pub fn render_insight_panel(f: &mut Frame, area: Rect, insights: &[Insight]) {
                     "  {}",
                     theme::trunc(&insight.body, (inner.width as usize).saturating_sub(4))
                 ),
-                Style::default().fg(C_DIM),
+                Style::default().fg(THEME.text_muted),
             ));
 
             ListItem::new(vec![title_line, body_line])
@@ -72,8 +72,8 @@ pub fn render_insight_panel(f: &mut Frame, area: Rect, insights: &[Insight]) {
 pub fn render_task_graph(f: &mut Frame, area: Rect, tasks: &[Task]) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(C_FRAME))
-        .title(Span::styled(" Tasks ", Style::default().fg(C_TEXT)));
+        .border_style(Style::default().fg(THEME.border))
+        .title(Span::styled(" Tasks ", Style::default().fg(THEME.text_primary)));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -91,11 +91,11 @@ pub fn render_task_graph(f: &mut Frame, area: Rect, tasks: &[Task]) {
                 Span::styled(format!(" {} ", viz.dot), Style::default().fg(viz.color)),
                 Span::styled(
                     format!("{}. ", task.index + 1),
-                    Style::default().fg(C_DIM),
+                    Style::default().fg(THEME.text_muted),
                 ),
                 Span::styled(
                     theme::trunc(&task.title, (inner.width as usize).saturating_sub(12)),
-                    Style::default().fg(C_TEXT),
+                    Style::default().fg(THEME.text_primary),
                 ),
             ];
 
@@ -104,7 +104,7 @@ pub fn render_task_graph(f: &mut Frame, area: Rect, tasks: &[Task]) {
                 let deps: Vec<String> = task.dependencies.iter().map(|d| format!("{}", d + 1)).collect();
                 spans.push(Span::styled(
                     format!(" ← {}", deps.join(",")),
-                    Style::default().fg(C_DIM),
+                    Style::default().fg(THEME.text_muted),
                 ));
             }
 
@@ -129,11 +129,11 @@ fn category_icon(cat: &InsightCategory) -> &'static str {
 
 fn category_color(cat: &InsightCategory) -> ratatui::style::Color {
     match cat {
-        InsightCategory::Pattern => C_INFO,
-        InsightCategory::Architecture => C_BRAND,
-        InsightCategory::Tool => C_DIM,
-        InsightCategory::Decision => theme::C_READY,
-        InsightCategory::Concept => theme::C_ACCENT,
-        InsightCategory::Why => theme::C_READY,
+        InsightCategory::Pattern => THEME.accent,
+        InsightCategory::Architecture => THEME.accent,
+        InsightCategory::Tool => THEME.text_muted,
+        InsightCategory::Decision => THEME.warning,
+        InsightCategory::Concept => THEME.accent,
+        InsightCategory::Why => THEME.warning,
     }
 }

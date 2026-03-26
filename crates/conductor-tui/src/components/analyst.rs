@@ -12,7 +12,7 @@ use conductor_types::AnalystState;
 
 use crate::{
     layout::LayoutConfig,
-    theme::{self, C_BRAND, C_DIM, C_TEXT},
+    theme::{self, THEME},
 };
 
 /// Render the analyst grid — one column per analyst.
@@ -66,10 +66,10 @@ fn render_analyst_column(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(C_BRAND))
+        .border_style(Style::default().fg(THEME.accent))
         .title(Span::styled(
             theme::trunc(&title, area.width.saturating_sub(2) as usize),
-            Style::default().fg(C_TEXT),
+            Style::default().fg(THEME.text_primary),
         ));
 
     let inner = block.inner(area);
@@ -108,6 +108,6 @@ fn render_analyst_column(
     f.render_widget(output, output_area);
 
     let elapsed = theme::elapsed(analyst.elapsed_ms);
-    let stats = Line::from(Span::styled(elapsed, Style::default().fg(C_DIM)));
+    let stats = Line::from(Span::styled(elapsed, Style::default().fg(THEME.text_muted)));
     f.render_widget(Paragraph::new(stats), stats_area);
 }
