@@ -2,13 +2,13 @@
 
 use ratatui::{
     layout::Rect,
-    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
-use crate::theme::{self, THEME};
+use crate::theme::{self, SURFACE};
+use crate::widgets::{render_borderless_panel, render_empty_state};
 
 /// Render conductor output as a scrollable panel in the main content area.
 pub fn render_conductor_output(
@@ -19,24 +19,14 @@ pub fn render_conductor_output(
     scroll_offset: u16,
 ) {
     let title = format!(" {} ", phase_label);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME.accent))
-        .title(Span::styled(title, Style::default().fg(THEME.accent)));
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = render_borderless_panel(f, area, Some(&title), SURFACE);
 
     if inner.height == 0 || inner.width < 4 {
         return;
     }
 
     if conductor_output.is_empty() {
-        let empty = Paragraph::new(Span::styled(
-            "Waiting for conductor...",
-            Style::default().fg(THEME.text_muted),
-        ));
-        f.render_widget(empty, inner);
+        render_empty_state(f, inner, "Waiting for conductor...");
         return;
     }
 
