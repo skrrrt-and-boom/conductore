@@ -13,7 +13,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::theme::{ACCENT_DIM, C_ACCENT, C_DIM, C_FRAME, SURFACE, TEXT_LABEL, TEXT_PRIMARY};
+use crate::theme::THEME;
 
 // ── Section Header ────────────────────────────────────────────────────────────
 
@@ -29,12 +29,12 @@ pub fn render_section_header(f: &mut Frame, area: Rect, title: &str, badge: Opti
         // Pad between title and badge so badge lands at the right edge
         let padding = total.saturating_sub(title_len).saturating_sub(badge_len);
         Line::from(vec![
-            Span::styled(title.to_string(), Style::default().fg(C_ACCENT)),
+            Span::styled(title.to_string(), Style::default().fg(THEME.accent)),
             Span::styled(" ".repeat(padding), Style::default()),
-            Span::styled(badge_text.to_string(), Style::default().fg(C_DIM)),
+            Span::styled(badge_text.to_string(), Style::default().fg(THEME.text_muted)),
         ])
     } else {
-        Line::from(Span::styled(title.to_string(), Style::default().fg(C_ACCENT)))
+        Line::from(Span::styled(title.to_string(), Style::default().fg(THEME.accent)))
     };
 
     f.render_widget(Paragraph::new(line), area);
@@ -47,7 +47,7 @@ pub fn render_section_header(f: &mut Frame, area: Rect, title: &str, badge: Opti
 pub fn render_thin_separator(f: &mut Frame, area: Rect) {
     let line = "─".repeat(area.width as usize);
     f.render_widget(
-        Paragraph::new(Span::styled(line, Style::default().fg(C_FRAME))),
+        Paragraph::new(Span::styled(line, Style::default().fg(THEME.border))),
         area,
     );
 }
@@ -76,8 +76,8 @@ pub fn render_progress_bar(f: &mut Frame, area: Rect, progress: f64, width: usiz
     let empty = width - filled;
 
     let line = Line::from(vec![
-        Span::styled("━".repeat(filled), Style::default().fg(C_ACCENT)),
-        Span::styled("╌".repeat(empty), Style::default().fg(C_FRAME)),
+        Span::styled("━".repeat(filled), Style::default().fg(THEME.accent)),
+        Span::styled("╌".repeat(empty), Style::default().fg(THEME.border)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -98,7 +98,7 @@ pub fn render_empty_state(f: &mut Frame, area: Rect, message: &str) {
         width: area.width,
         height: 1,
     };
-    let p = Paragraph::new(Span::styled(message.to_string(), Style::default().fg(C_DIM)))
+    let p = Paragraph::new(Span::styled(message.to_string(), Style::default().fg(THEME.text_muted)))
         .alignment(Alignment::Center);
     f.render_widget(p, row);
 }
@@ -118,7 +118,7 @@ pub fn render_card(f: &mut Frame, area: Rect, focused: bool) -> Rect {
     if focused && area.width > 2 {
         // 2-column accent strip on the left edge
         let strip = Rect { x: area.x, y: area.y, width: 2, height: area.height };
-        let accent_strip = Block::default().style(Style::default().bg(C_ACCENT));
+        let accent_strip = Block::default().style(Style::default().bg(THEME.accent));
         f.render_widget(accent_strip, strip);
 
         // Return inner rect excluding the strip
@@ -159,9 +159,9 @@ pub fn render_modal_backdrop(f: &mut Frame, area: Rect) {
 /// ```
 pub fn render_key_hint(key: &str, action: &str) -> Vec<Span<'static>> {
     vec![
-        Span::styled(format!("[{key}]"), Style::default().fg(C_ACCENT)),
+        Span::styled(format!("[{key}]"), Style::default().fg(THEME.accent)),
         Span::styled(" ".to_string(), Style::default()),
-        Span::styled(action.to_string(), Style::default().fg(C_DIM)),
+        Span::styled(action.to_string(), Style::default().fg(THEME.text_muted)),
     ]
 }
 
@@ -193,7 +193,7 @@ pub fn render_borderless_panel(
             f.render_widget(
                 Paragraph::new(Span::styled(
                     title_text.to_string(),
-                    Style::default().fg(C_ACCENT),
+                    Style::default().fg(THEME.accent),
                 )),
                 title_area,
             );
@@ -216,7 +216,7 @@ pub fn render_borderless_panel(
 ///
 /// Call at the top of every tab render function before drawing content.
 pub fn render_tab_content_area(f: &mut Frame, area: Rect) -> Rect {
-    f.render_widget(Block::default().style(Style::default().bg(SURFACE)), area);
+    f.render_widget(Block::default().style(Style::default().bg(THEME.surface)), area);
 
     Rect {
         x: area.x + 1,
@@ -237,9 +237,9 @@ pub fn render_tab_content_area(f: &mut Frame, area: Rect) -> Rect {
 /// ```
 pub fn render_inline_kv(key: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(key.to_string(), Style::default().fg(TEXT_LABEL)),
+        Span::styled(key.to_string(), Style::default().fg(THEME.text_label)),
         Span::raw(" "),
-        Span::styled(value.to_string(), Style::default().fg(TEXT_PRIMARY)),
+        Span::styled(value.to_string(), Style::default().fg(THEME.text_primary)),
     ])
 }
 
@@ -269,7 +269,7 @@ pub fn render_tool_icon(tool_name: &str) -> Span<'static> {
         "Glob" => "[G]",
         _ => "[·]",
     };
-    Span::styled(icon, Style::default().fg(ACCENT_DIM))
+    Span::styled(icon, Style::default().fg(THEME.accent_dim))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -277,14 +277,13 @@ pub fn render_tool_icon(tool_name: &str) -> Span<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{ACCENT, TEXT_MUTED};
 
     #[test]
     fn render_inline_kv_key_uses_label_color() {
         let line = render_inline_kv("Model", "claude-opus");
         let key_span = &line.spans[0];
         assert_eq!(key_span.content, "Model");
-        assert_eq!(key_span.style.fg, Some(TEXT_LABEL));
+        assert_eq!(key_span.style.fg, Some(THEME.text_label));
     }
 
     #[test]
@@ -292,7 +291,7 @@ mod tests {
         let line = render_inline_kv("Model", "claude-opus");
         let val_span = &line.spans[2];
         assert_eq!(val_span.content, "claude-opus");
-        assert_eq!(val_span.style.fg, Some(TEXT_PRIMARY));
+        assert_eq!(val_span.style.fg, Some(THEME.text_primary));
     }
 
     #[test]
@@ -321,15 +320,15 @@ mod tests {
     #[test]
     fn render_tool_icon_uses_accent_dim_color() {
         let span = render_tool_icon("Read");
-        assert_eq!(span.style.fg, Some(ACCENT_DIM));
+        assert_eq!(span.style.fg, Some(THEME.accent_dim));
     }
 
     #[test]
     fn render_tool_icon_unknown_not_accent() {
         let span = render_tool_icon("Unknown");
         // ACCENT_DIM, not ACCENT
-        assert_ne!(span.style.fg, Some(ACCENT));
-        assert_eq!(span.style.fg, Some(ACCENT_DIM));
+        assert_ne!(span.style.fg, Some(THEME.accent));
+        assert_eq!(span.style.fg, Some(THEME.accent_dim));
     }
 
     #[test]
@@ -390,8 +389,8 @@ mod tests {
     fn render_key_hint_format() {
         let spans = render_key_hint("q", "quit");
         assert_eq!(spans[0].content, "[q]");
-        assert_eq!(spans[0].style.fg, Some(ACCENT));
+        assert_eq!(spans[0].style.fg, Some(THEME.accent));
         assert_eq!(spans[2].content, "quit");
-        assert_eq!(spans[2].style.fg, Some(TEXT_MUTED));
+        assert_eq!(spans[2].style.fg, Some(THEME.text_muted));
     }
 }
