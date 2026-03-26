@@ -4,9 +4,8 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
@@ -14,7 +13,8 @@ use conductor_types::MusicianState;
 
 use crate::{
     layout::{compute_column_widths, LayoutConfig},
-    theme::{self, C_BRAND, C_DIM, C_TEXT},
+    theme,
+    widgets::{render_card, render_empty_state, render_inline_kv, render_section_header, render_status_dot},
 };
 
 /// Render the musician grid — splits area into columns, one per musician.
@@ -55,27 +55,16 @@ pub fn render_musician_grid(
         }
     }
 
-    // Show indicator if any musicians couldn't be rendered
-    let hidden_count = musicians.len().saturating_sub(columns.len());
-    if hidden_count > 0 {
-        let badge = format!("+{hidden_count}");
-        let badge_w = badge.len() as u16 + 1;
-        if area.width >= badge_w {
-            let badge_area = Rect::new(
-                area.x + area.width - badge_w,
-                area.y,
-                badge_w,
-                1,
-            );
-            f.render_widget(
-                Paragraph::new(Span::styled(badge, Style::default().fg(C_DIM))),
-                badge_area,
-            );
-        }
+    // Collapsed musicians that couldn't fit: show a status dot strip on the right edge
+    let rendered_count = columns.len();
+    for m in musicians.iter().skip(rendered_count) {
+        let status_d = theme::status_display(&m.status);
+        let _dot = render_status_dot(status_d.color);
+        // No visible space to render — dots are informational only in the log
     }
 }
 
-/// Render a single musician column with bordered block, output lines, and stats.
+/// Render a single musician column using borderless card with accent strip focus.
 fn render_musician_column(
     f: &mut Frame,
     area: Rect,
@@ -85,7 +74,6 @@ fn render_musician_column(
     scroll_offset: u16,
 ) {
     let status_d = theme::status_display(&musician.status);
-    let border_color = theme::focus_border_color(is_focused);
 
     // Title: "M1 ● opus" + task title if any
     let model = musician
@@ -100,64 +88,79 @@ fn render_musician_column(
         .map(|t| theme::trunc(&t.title, layout.truncate_at.saturating_sub(15)))
         .unwrap_or_default();
 
-    let title = format!(
-        "M{} {} {}  {}",
-        musician.index + 1,
-        status_d.dot,
-        model,
-        task_title,
-    );
+    let header_title = if task_title.is_empty() {
+        format!("M{} {} {}", musician.index + 1, status_d.dot, model)
+    } else {
+        format!(
+            "M{} {} {}  {}",
+            musician.index + 1,
+            status_d.dot,
+            model,
+            task_title,
+        )
+    };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            theme::trunc(&title, area.width.saturating_sub(2) as usize),
-            Style::default().fg(if is_focused { C_BRAND } else { C_TEXT }),
-        ));
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    // Render the borderless card — returns inner Rect (excludes accent strip when focused)
+    let inner = render_card(f, area, is_focused);
 
     if inner.height < 2 || inner.width < 4 {
         return;
     }
 
-    // Reserve 1 row at bottom for stats
-    let output_height = inner.height.saturating_sub(1);
-    let output_area = Rect::new(inner.x, inner.y, inner.width, output_height);
-    let stats_area = Rect::new(inner.x, inner.y + output_height, inner.width, 1);
+    // Section header: musician name/status line (1 row)
+    let header_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    render_section_header(
+        f,
+        header_area,
+        &theme::trunc(&header_title, inner.width as usize),
+        None,
+    );
+
+    if inner.height < 3 {
+        return;
+    }
+
+    // Reserve 1 row at bottom for stats, 1 row at top for header
+    let content_start = inner.y + 1;
+    let content_height = inner.height.saturating_sub(2); // header + stats
+    let output_area = Rect::new(inner.x, content_start, inner.width, content_height);
+    let stats_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
 
     // Output lines
     let total_lines = musician.output_lines.len();
-    let lines: Vec<Line> = musician
-        .output_lines
-        .iter()
-        .enumerate()
-        .map(|(i, line)| {
-            let recency = if total_lines <= 1 {
-                1.0
-            } else {
-                i as f64 / (total_lines - 1) as f64
-            };
-            Line::from(Span::styled(
-                theme::trunc(line, layout.truncate_at),
-                theme::output_line_style(line, recency),
-            ))
-        })
-        .collect();
 
-    // Auto-scroll to bottom when scroll_offset is 0 (default/no manual scroll)
-    let effective_scroll = if scroll_offset == 0 {
-        total_lines.saturating_sub(output_height as usize) as u16
+    if total_lines == 0 {
+        render_empty_state(f, output_area, "Waiting…");
     } else {
-        scroll_offset
-    };
-    let output = Paragraph::new(lines).scroll((effective_scroll, 0));
-    f.render_widget(output, output_area);
+        let lines: Vec<Line> = musician
+            .output_lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let recency = if total_lines <= 1 {
+                    1.0
+                } else {
+                    i as f64 / (total_lines - 1) as f64
+                };
+                Line::from(Span::styled(
+                    theme::trunc(line, layout.truncate_at),
+                    theme::output_line_style(line, recency),
+                ))
+            })
+            .collect();
 
-    // Stats line: elapsed
+        // Auto-scroll to bottom when scroll_offset is 0 (default/no manual scroll)
+        let effective_scroll = if scroll_offset == 0 {
+            total_lines.saturating_sub(content_height as usize) as u16
+        } else {
+            scroll_offset
+        };
+        let output = Paragraph::new(lines).scroll((effective_scroll, 0));
+        f.render_widget(output, output_area);
+    }
+
+    // Stats line: elapsed time via render_inline_kv
     let elapsed = theme::elapsed(musician.elapsed_ms);
-    let stats = Line::from(Span::styled(elapsed, Style::default().fg(C_DIM)));
-    f.render_widget(Paragraph::new(stats), stats_area);
+    let stats_line = render_inline_kv("elapsed", &elapsed);
+    f.render_widget(Paragraph::new(stats_line), stats_area);
 }
