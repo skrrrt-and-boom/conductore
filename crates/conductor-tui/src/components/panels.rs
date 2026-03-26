@@ -6,15 +6,16 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table, Wrap},
+    widgets::{List, ListItem, Paragraph, Row, Table, Wrap},
     Frame,
 };
 
 use conductor_types::{Plan, PlanRefinementMessage, RefinementRole, SessionData, Task};
 
 use crate::{
-    app::{centered_rect, clear_area},
-    theme::{self, THEME},
+    app::centered_rect,
+    theme::{self, C_BRAND, C_DIM, C_ERROR, C_READY, C_TEXT, SURFACE},
+    widgets::{render_borderless_panel, render_inline_kv, render_key_hint, render_modal_backdrop, render_section_header},
 };
 
 // ─── Plan Review ─────────────────────────────────────────────────────────────
@@ -28,13 +29,7 @@ pub fn render_plan_review(
     refinement_history: &[PlanRefinementMessage],
     selected: usize,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME.accent))
-        .title(Span::styled(" Plan Review ", Style::default().fg(THEME.accent)));
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = render_borderless_panel(f, area, Some(" Plan Review"), SURFACE);
 
     if inner.height < 4 {
         return;
@@ -64,7 +59,7 @@ pub fn render_plan_review(
         let summary = Paragraph::new(vec![
             Line::from(Span::styled(
                 theme::trunc(&clean_summary, inner.width as usize),
-                Style::default().fg(THEME.text_primary),
+                Style::default().fg(C_TEXT),
             )),
             Line::from(Span::styled(
                 format!(
@@ -72,7 +67,7 @@ pub fn render_plan_review(
                     tasks.len(),
                     plan.estimated_minutes,
                 ),
-                Style::default().fg(THEME.text_muted),
+                Style::default().fg(C_DIM),
             )),
         ]);
         f.render_widget(summary, chunks[0]);
@@ -84,14 +79,14 @@ pub fn render_plan_review(
             .iter()
             .map(|msg| {
                 let (prefix, color) = match msg.role {
-                    RefinementRole::User => ("You: ", THEME.accent),
-                    RefinementRole::Conductor => ("Conductor: ", THEME.warning),
+                    RefinementRole::User => ("You: ", C_BRAND),
+                    RefinementRole::Conductor => ("Conductor: ", C_READY),
                 };
                 Line::from(vec![
                     Span::styled(prefix, Style::default().fg(color)),
                     Span::styled(
                         theme::trunc(&msg.text, (inner.width as usize).saturating_sub(15)),
-                        Style::default().fg(THEME.text_primary),
+                        Style::default().fg(C_TEXT),
                     ),
                 ])
             })
@@ -109,9 +104,9 @@ pub fn render_plan_review(
             let is_selected = i == selected;
             let indicator = if is_selected { "▸" } else { " " };
             let sel_style = if is_selected {
-                Style::default().fg(THEME.accent)
+                Style::default().fg(C_BRAND)
             } else {
-                Style::default().fg(THEME.text_primary)
+                Style::default().fg(C_TEXT)
             };
 
             let title_line = Line::from(vec![
@@ -139,7 +134,7 @@ pub fn render_plan_review(
                             task.dependencies.iter().map(|d| format!("{}", d + 1)).collect::<Vec<_>>().join(", ")
                         }
                     ),
-                    Style::default().fg(THEME.text_muted),
+                    Style::default().fg(C_DIM),
                 ),
             ]);
 
@@ -150,17 +145,17 @@ pub fn render_plan_review(
     let list = List::new(items);
     f.render_widget(list, chunks[2]);
 
-    // Controls
-    let controls = Paragraph::new(Line::from(vec![
-        Span::styled(" [Enter]", Style::default().fg(THEME.accent)),
-        Span::styled(" Approve  ", Style::default().fg(THEME.text_primary)),
-        Span::styled("[d]", Style::default().fg(THEME.accent)),
-        Span::styled(" Detail  ", Style::default().fg(THEME.text_primary)),
-        Span::styled("type to refine  ", Style::default().fg(THEME.text_muted)),
-        Span::styled("q", Style::default().fg(THEME.accent)),
-        Span::styled(" quit", Style::default().fg(THEME.text_primary)),
-    ]));
-    f.render_widget(controls, chunks[3]);
+    // Controls bar using render_key_hint spans
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::raw(" "));
+    spans.extend(render_key_hint("Enter", "Approve"));
+    spans.push(Span::raw("  "));
+    spans.extend(render_key_hint("d", "Detail"));
+    spans.push(Span::raw("  "));
+    spans.extend(render_key_hint("type", "refine"));
+    spans.push(Span::raw("  "));
+    spans.extend(render_key_hint("q", "quit"));
+    f.render_widget(Paragraph::new(Line::from(spans)), chunks[3]);
 }
 
 // ─── Session Browser ─────────────────────────────────────────────────────────
@@ -173,24 +168,18 @@ pub fn render_session_browser(
     selected: usize,
 ) {
     let popup = centered_rect(80, 70, area);
-    clear_area(f, popup);
+    render_modal_backdrop(f, popup);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME.accent))
-        .title(Span::styled(" Sessions ", Style::default().fg(THEME.accent)));
-
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
+    let inner = render_borderless_panel(f, popup, Some(" Sessions"), SURFACE);
 
     if sessions.is_empty() {
-        let empty = Paragraph::new(Span::styled("No sessions found", Style::default().fg(THEME.text_muted)));
+        let empty = Paragraph::new(Span::styled("No sessions found", Style::default().fg(C_DIM)));
         f.render_widget(empty, inner);
         return;
     }
 
     let header = Row::new(["ID", "Prompt", "Phase", "Tasks"])
-        .style(Style::default().fg(THEME.text_muted).add_modifier(Modifier::BOLD));
+        .style(Style::default().fg(C_DIM).add_modifier(Modifier::BOLD));
 
     // Max width for prompt column (fill remaining space)
     let prompt_width = inner.width.saturating_sub(10 + 16 + 6 + 6) as usize; // ID + Phase + Tasks + spacing
@@ -200,9 +189,9 @@ pub fn render_session_browser(
         .enumerate()
         .map(|(i, s)| {
             let style = if i == selected {
-                Style::default().fg(THEME.accent)
+                Style::default().fg(C_BRAND)
             } else {
-                Style::default().fg(THEME.text_primary)
+                Style::default().fg(C_TEXT)
             };
 
             // Show first line of task description as prompt
@@ -238,6 +227,13 @@ pub fn render_session_browser(
 
 // ─── Task Detail Modal ───────────────────────────────────────────────────────
 
+/// Row items for the task detail modal content.
+enum RowItem {
+    SectionHeader(String),
+    Content(Line<'static>),
+    Blank,
+}
+
 /// Render a task detail modal as a centered overlay.
 pub fn render_task_detail(
     f: &mut Frame,
@@ -247,128 +243,142 @@ pub fn render_task_detail(
     scroll_offset: u16,
 ) {
     let popup = centered_rect(70, 80, area);
-    clear_area(f, popup);
+    render_modal_backdrop(f, popup);
 
     let title = format!(" Task {}: {} ", task.index + 1, theme::trunc(&task.title, 40));
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME.accent))
-        .title(Span::styled(title, Style::default().fg(THEME.accent)));
+    let inner = render_borderless_panel(f, popup, Some(&title), SURFACE);
 
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
+    // Build a list of row items to render
+    let mut rows: Vec<RowItem> = Vec::new();
 
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Status + assigned musician
+    // Status line
     let viz = theme::task_viz(&task.status);
-    lines.push(Line::from(vec![
+    rows.push(RowItem::Content(Line::from(vec![
         Span::styled(format!("{} {:?}", viz.dot, task.status), Style::default().fg(viz.color)),
-        Span::styled(
-            format!(
-                "   Musician: {}",
-                task.assigned_musician.as_deref().unwrap_or("—")
-            ),
-            Style::default().fg(THEME.text_muted),
-        ),
-    ]));
-    lines.push(Line::raw(""));
+    ])));
+
+    // Musician via render_inline_kv
+    rows.push(RowItem::Content(
+        render_inline_kv("Musician:", task.assigned_musician.as_deref().unwrap_or("—"))
+    ));
+    rows.push(RowItem::Blank);
 
     // Description
-    lines.push(Line::from(Span::styled("DESCRIPTION", Style::default().fg(THEME.text_muted))));
+    rows.push(RowItem::SectionHeader("DESCRIPTION".to_string()));
     let clean_desc = theme::strip_control_chars(&task.description);
     for line in clean_desc.lines() {
-        lines.push(Line::from(Span::styled(line, Style::default().fg(THEME.text_primary))));
+        rows.push(RowItem::Content(Line::from(Span::styled(line.to_string(), Style::default().fg(C_TEXT)))));
     }
-    lines.push(Line::raw(""));
+    rows.push(RowItem::Blank);
 
     // Why
     if !task.why.is_empty() {
-        lines.push(Line::from(Span::styled("WHY", Style::default().fg(THEME.warning))));
+        rows.push(RowItem::SectionHeader("WHY".to_string()));
         for line in task.why.lines() {
-            lines.push(Line::from(Span::styled(line, Style::default().fg(THEME.text_primary))));
+            rows.push(RowItem::Content(Line::from(Span::styled(line.to_string(), Style::default().fg(C_TEXT)))));
         }
-        lines.push(Line::raw(""));
+        rows.push(RowItem::Blank);
     }
 
     // Files
     if !task.file_scope.is_empty() {
-        lines.push(Line::from(Span::styled("FILES", Style::default().fg(THEME.text_muted))));
+        rows.push(RowItem::SectionHeader("FILES".to_string()));
         for file in &task.file_scope {
-            lines.push(Line::from(Span::styled(format!("  • {file}"), Style::default().fg(THEME.text_primary))));
+            rows.push(RowItem::Content(Line::from(Span::styled(format!("  • {file}"), Style::default().fg(C_TEXT)))));
         }
-        lines.push(Line::raw(""));
+        rows.push(RowItem::Blank);
     }
 
     // Dependencies
     if !task.dependencies.is_empty() {
-        lines.push(Line::from(Span::styled("DEPENDENCIES", Style::default().fg(THEME.text_muted))));
+        rows.push(RowItem::SectionHeader("DEPENDENCIES".to_string()));
         for &dep_idx in &task.dependencies {
             let dep_name = all_tasks
                 .get(dep_idx)
                 .map(|t| t.title.as_str())
                 .unwrap_or("?");
-            lines.push(Line::from(Span::styled(
+            rows.push(RowItem::Content(Line::from(Span::styled(
                 format!("  • Task {}: {dep_name}", dep_idx + 1),
-                Style::default().fg(THEME.text_primary),
-            )));
+                Style::default().fg(C_TEXT),
+            ))));
         }
-        lines.push(Line::raw(""));
+        rows.push(RowItem::Blank);
     }
 
     // Acceptance criteria
     if !task.acceptance_criteria.is_empty() {
-        lines.push(Line::from(Span::styled("ACCEPTANCE CRITERIA", Style::default().fg(THEME.text_muted))));
+        rows.push(RowItem::SectionHeader("ACCEPTANCE CRITERIA".to_string()));
         for ac in &task.acceptance_criteria {
-            lines.push(Line::from(Span::styled(format!("  • {ac}"), Style::default().fg(THEME.text_primary))));
+            rows.push(RowItem::Content(Line::from(Span::styled(format!("  • {ac}"), Style::default().fg(C_TEXT)))));
         }
-        lines.push(Line::raw(""));
+        rows.push(RowItem::Blank);
     }
 
     // Result (if completed)
     if let Some(result) = &task.result {
-        lines.push(Line::from(Span::styled("RESULT", Style::default().fg(THEME.text_muted))));
-        let status_label = if result.success { "Success" } else { "Failed" };
-        let status_color = if result.success { THEME.success } else { THEME.error };
-        lines.push(Line::from(Span::styled(status_label, Style::default().fg(status_color))));
+        rows.push(RowItem::SectionHeader("RESULT".to_string()));
+        let status_label = if result.success { "Success".to_string() } else { "Failed".to_string() };
+        let status_color = if result.success { theme::C_ACTIVE } else { C_ERROR };
+        rows.push(RowItem::Content(Line::from(Span::styled(status_label, Style::default().fg(status_color)))));
 
         if !result.summary.is_empty() {
             for line in result.summary.lines() {
-                lines.push(Line::from(Span::styled(
+                rows.push(RowItem::Content(Line::from(Span::styled(
                     format!("  {line}"),
-                    Style::default().fg(THEME.text_primary),
-                )));
+                    Style::default().fg(C_TEXT),
+                ))));
             }
         }
 
         if let Some(err) = &result.error {
-            lines.push(Line::from(Span::styled(
+            rows.push(RowItem::Content(Line::from(Span::styled(
                 format!("  Error: {err}"),
-                Style::default().fg(THEME.error),
-            )));
+                Style::default().fg(C_ERROR),
+            ))));
         }
 
         if !result.files_modified.is_empty() {
-            lines.push(Line::from(Span::styled("FILES MODIFIED", Style::default().fg(THEME.text_muted))));
+            rows.push(RowItem::SectionHeader("FILES MODIFIED".to_string()));
             for file in &result.files_modified {
-                lines.push(Line::from(Span::styled(
+                rows.push(RowItem::Content(Line::from(Span::styled(
                     format!("  • {file}"),
-                    Style::default().fg(THEME.text_primary),
-                )));
+                    Style::default().fg(C_TEXT),
+                ))));
             }
         }
     }
 
-    // Footer
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "[Esc] Close  [↑↓] Scroll",
-        Style::default().fg(THEME.text_muted),
-    )));
+    // Footer hint
+    rows.push(RowItem::Blank);
+    rows.push(RowItem::Content({
+        let mut spans: Vec<Span> = Vec::new();
+        spans.extend(render_key_hint("Esc", "Close"));
+        spans.push(Span::raw("  "));
+        spans.extend(render_key_hint("↑↓", "Scroll"));
+        Line::from(spans)
+    }));
 
-    let content = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_offset, 0));
+    // Render visible rows respecting scroll_offset
+    let skip = scroll_offset as usize;
+    let max_rows = inner.height as usize;
 
-    f.render_widget(content, inner);
+    for (i, row) in rows.iter().skip(skip).take(max_rows).enumerate() {
+        let row_rect = Rect {
+            x: inner.x,
+            y: inner.y + i as u16,
+            width: inner.width,
+            height: 1,
+        };
+        match row {
+            RowItem::SectionHeader(title) => {
+                render_section_header(f, row_rect, title, None);
+            }
+            RowItem::Content(line) => {
+                f.render_widget(Paragraph::new(line.clone()), row_rect);
+            }
+            RowItem::Blank => {
+                // empty row — nothing to render
+            }
+        }
+    }
 }
