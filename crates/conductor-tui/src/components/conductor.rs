@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::theme::{self, C_BRAND, C_DIM};
+use crate::theme::{self, THEME};
 
 /// Render conductor output as a scrollable panel in the main content area.
 pub fn render_conductor_output(
@@ -21,8 +21,8 @@ pub fn render_conductor_output(
     let title = format!(" {} ", phase_label);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(C_BRAND))
-        .title(Span::styled(title, Style::default().fg(C_BRAND)));
+        .border_style(Style::default().fg(THEME.accent))
+        .title(Span::styled(title, Style::default().fg(THEME.accent)));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -34,7 +34,7 @@ pub fn render_conductor_output(
     if conductor_output.is_empty() {
         let empty = Paragraph::new(Span::styled(
             "Waiting for conductor...",
-            Style::default().fg(C_DIM),
+            Style::default().fg(THEME.text_muted),
         ));
         f.render_widget(empty, inner);
         return;
