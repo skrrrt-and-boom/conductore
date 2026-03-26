@@ -70,6 +70,28 @@ pub const C_INFO: Color = ACCENT;
 /// Musical theme touches
 pub const C_ACCENT: Color = ACCENT;
 
+// ── Theme Struct ──────────────────────────────────────────────────────────────
+
+/// Typed color bundle for components that prefer struct access over bare constants.
+pub struct Theme {
+    pub accent: Color,
+    pub text_muted: Color,
+    pub text_primary: Color,
+    pub error: Color,
+    pub warning: Color,
+    pub success: Color,
+}
+
+/// Global theme instance — use `THEME.field` in components.
+pub static THEME: Theme = Theme {
+    accent: ACCENT,
+    text_muted: TEXT_MUTED,
+    text_primary: TEXT_PRIMARY,
+    error: ERROR,
+    warning: WARNING,
+    success: SUCCESS,
+};
+
 // ── Style Helpers ─────────────────────────────────────────────────────────────
 
 /// Primary text style
