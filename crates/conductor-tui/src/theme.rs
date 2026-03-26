@@ -70,6 +70,36 @@ pub const C_INFO: Color = ACCENT;
 /// Musical theme touches
 pub const C_ACCENT: Color = ACCENT;
 
+// ── Theme Struct ──────────────────────────────────────────────────────────────
+
+/// Grouped theme colors for use via `THEME.field` syntax.
+pub struct Theme {
+    pub bg: Color,
+    pub surface: Color,
+    pub border: Color,
+    pub text_primary: Color,
+    pub text_secondary: Color,
+    pub text_muted: Color,
+    pub accent: Color,
+    pub success: Color,
+    pub error: Color,
+    pub warning: Color,
+}
+
+/// Global theme instance — use `THEME.field` instead of bare constants.
+pub const THEME: Theme = Theme {
+    bg: BG,
+    surface: SURFACE,
+    border: BORDER,
+    text_primary: TEXT_PRIMARY,
+    text_secondary: TEXT_SECONDARY,
+    text_muted: TEXT_MUTED,
+    accent: ACCENT,
+    success: SUCCESS,
+    error: ERROR,
+    warning: WARNING,
+};
+
 // ── Style Helpers ─────────────────────────────────────────────────────────────
 
 /// Primary text style
